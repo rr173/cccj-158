@@ -86,3 +86,24 @@ class SubscriptionClosed(SubscriptionError):
 class StaleSubscriptionGeneration(SubscriptionError):
     """A batch/acknowledgement belongs to a superseded subscription generation."""
 
+
+class SchemaConflictError(ManagedTxError):
+    """Commit refused because a migration changed a table the transaction writes.
+
+    A transaction's start view fixes not only the data snapshot but also the
+    column definition of every table it may touch.  When an online
+    :meth:`Client.add_column` migration lands between a transaction's begin and
+    its commit, that transaction may still read using its original column
+    definition.  If it tries to *write* an affected table, the commit is
+    rejected with this explicit, evidence-carrying result and leaves no write
+    behind.
+    """
+
+    def __init__(self, message, code, evidence):
+        super().__init__(message)
+        self.code = code
+        self.evidence = evidence
+
+    def as_dict(self):
+        return {"error": self.code, "message": str(self), "evidence": self.evidence}
+

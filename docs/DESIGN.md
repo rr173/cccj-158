@@ -201,3 +201,88 @@ version guard in the row writer is a second line of defence: an older image
 never overwrites a newer one.  A generation change is refused unless the
 caller explicitly reinitialises, so the old full load and a new full load are
 never interleaved.
+
+## 7. Online add-column migration
+
+### Versioned column catalog
+
+The flat `table_columns` catalog is retained for tooling, but the authority for
+what a snapshot may see is `table_schemas`, an append-only, per-table history of
+immutable column descriptors.  Each row fixes an ordered column list (name,
+type, and any declared default) and the `effective_version` — the source
+position at which that shape took effect.  Resolving the schema of a table at
+snapshot `V` is "the newest `table_schemas` row with `effective_version <= V`".
+The initial `create_table` shape is schema version 1 effective at position 0, so
+a transaction beginning on an empty repository already resolves its tables.
+
+Because every read materializes rows through the schema effective at the
+transaction's `base_version` rather than the live catalog, a transaction keeps
+its start-view columns for its whole life.  No long-lived lock is involved: the
+resolution is a point query inside the same short transaction that performs the
+read.
+
+### Why no row rewrite
+
+`add_column` runs one `BEGIN IMMEDIATE` transaction that (1) validates the table
+and column name and the default against the declared domain, (2)
+`ALTER TABLE … ADD COLUMN … DEFAULT <literal>` on the append-only history
+table, (3) appends the next immutable `table_schemas` row, (4) inserts a
+`schema_changes` event, and (5) bumps `commit_version`.  SQLite fills the new
+physical column with the constant default for existing rows without touching
+their content or their `version`, so an old image is still stamped with its
+original business version yet reads the default under a new enough snapshot.
+The migration therefore cannot be mistaken for an update to every row, and a
+failed validation rolls back the entire short transaction, leaving no half
+column, event or position.
+
+The default literal is built only from a value already validated against one of
+the four domains; identifiers are quoted, so no free-form SQL can reach the
+`ALTER`.  Only `add_column` is ever written to `schema_changes`; the product
+exposes no drop, rename or retype.
+
+### Structural conflicts and the serial order
+
+A schema change occupies an ordinary position in the same ordered stream as
+row commits.  Consider a transaction `T` that began at `s(T)` and a migration
+`M` at position `m > s(T)` on a table `T` writes.  `T`'s staged values conform
+to the old column set; letting them commit after `M` would write an image that
+silently predates the current structure.  Instead the engine compares the
+column set effective at `s(T)` with the live set when `T` stages a write (and
+defensively again inside the atomic commit): if they differ it raises a
+`schema_conflict` with evidence naming the migration and the added columns, and
+writes nothing.  Read-only transactions and reads inside `T` are unaffected and
+still serialize at the start view, so the rule refuses only actions that cannot
+be placed in a single consistent serial order.  Writers to other tables and
+non-conflicting data commits proceed normally while migration runs, since the
+migration holds only a short write lock.
+
+Inserts that omit the new column are filled with the declared default at
+staging time, so every committed image is complete under its own schema; an
+explicit value goes through the normal `check_value` validation.  This keeps
+the append-only writer (which names every declared column) unchanged.
+
+### Subscription and replica hand-off
+
+A subscription freezes both the column types and the declared defaults at its
+cut.  A full load therefore always describes the cut's shape, and a migration
+landing mid-pagination cannot alter unread pages: they are computed from history
+at `S` with the frozen descriptor.  After the full load completes, the
+incremental builder consults `sub_changes` and `schema_changes` together and
+emits whichever event has the earliest position.  A migration commit never also
+carries row changes, so the earliest position is unambiguously one kind, and the
+consumer always receives the structural switch before the row commits that
+follow it.  A subscription created after the migration freezes the new shape and
+never needs the event.
+
+On the replica the schema event is applied as one local transaction: the
+idempotent `ALTER TABLE … ADD COLUMN … DEFAULT`, an update of the locally
+recorded schema/default metadata, the new position and the `batch_id` all commit
+together, and the source ack follows only afterwards.  A crash before the ack
+redelivers the same batch; the recorded `batch_id` makes the local apply a
+no-op and the column is never added twice, while later row batches are written
+through the replica's current (post-switch) schema.  Both change logs share one
+retention boundary — the minimum acknowledged position of open subscriptions —
+so a slow full load, a pending old batch and an in-flight old transaction keep
+exactly the structural and row versions they still need, and explicit cleanup
+reclaims the rest and reports the boundary.
+

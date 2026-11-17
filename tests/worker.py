@@ -16,7 +16,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from mrtx import Client, ConflictError, ManagedTxError  # noqa: E402
+from mrtx import (Client, ConflictError, ManagedTxError,
+                  SchemaConflictError)  # noqa: E402
 from mrtx.engine import TransactionHandle  # noqa: E402
 from mrtx.subscription import SubscriptionHandle  # noqa: E402
 
@@ -91,6 +92,12 @@ def handle_command(client, handles, cmd):
     if name == "create_subscription":
         sub, cut = client.create_subscription(cmd["name"], cmd["tables"])
         return {"ok": True, "cut": cut, "handle": sub.handle.as_dict()}
+    if name == "add_column":
+        return {"ok": True,
+                "result": client.add_column(cmd["table"], cmd["column"],
+                                            cmd["type"], cmd["default"])}
+    if name == "schema_history":
+        return {"ok": True, "result": client.schema_history(cmd.get("table"))}
     if name == "pull":
         out = client.pull(SubscriptionHandle.from_dict(cmd["handle"]),
                           max_rows=cmd.get("max_rows", 100))
@@ -141,6 +148,10 @@ def main():
         except ConflictError as exc:
             result = {"ok": False, "error": "conflict", "code": exc.code,
                       "message": str(exc), "evidence": exc.evidence}
+        except SchemaConflictError as exc:
+            result = {"ok": False, "error": "SchemaConflictError",
+                      "code": exc.code, "message": str(exc),
+                      "evidence": exc.evidence}
         except ManagedTxError as exc:
             result = {"ok": False, "error": type(exc).__name__, "message": str(exc)}
         except Exception as exc:  # noqa: BLE001 - report to parent

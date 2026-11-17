@@ -22,7 +22,7 @@ library.
 # from the directory containing the mrtx/ package
 python3 -c "import mrtx; print(mrtx.Client)"
 
-# full test suite (stdlib unittest, 112 tests)
+# full test suite (stdlib unittest, 140 tests)
 cd tests && python3 -m unittest discover -s . -p 'test_*.py'
 
 # the runnable end-to-end drills
@@ -30,6 +30,7 @@ python3 -m mrtx.drill                       # transactions: isolation/conflicts
 python3 -m mrtx.drill --db /tmp/keep.db     # keep the database
 python3 -m mrtx.sync_drill                  # subscriptions + SQLite replica
 python3 -m mrtx.sync_drill --keep /tmp/sync # keep both databases
+python3 -m mrtx.online_add_column_drill     # online add-column migration
 ```
 
 Each drill exits 0 only if every expectation holds; it prints the actual read
@@ -240,11 +241,13 @@ Guaranteed:
   replay;
 * a rejected commit returns concrete evidence, not a bare version mismatch.
 
-Limits: only data written through `mrtx` is managed; schema changes are
-supported only through `create_table`; this is not an arbitrary-SQL engine and
-not a distributed transaction protocol.  Readers keep their snapshot version
-alive; a client that never commits or aborts a transaction will delay GC until
-its process exits or its lease expires — so always close transactions.
+Limits: only data written through `mrtx` is managed; the only supported
+schema changes are `create_table` and the single-column online
+`add_column` described in the next section (no drop/rename/retype, no
+arbitrary SQL).  This is not an arbitrary-SQL engine and not a distributed
+transaction protocol.  Readers keep their snapshot version alive; a client
+that never commits or aborts a transaction will delay GC until its process
+exits or its lease expires — so always close transactions.
 
 Cost model: each `read`/`stage_*` is one short SQLite transaction that
 re-evaluates the fixed snapshot for the affected table, so an operation is
@@ -362,41 +365,123 @@ rep.rows("accounts")              # raises ReplicaNotReady until "ready"
 
 ---
 
-## 8. Repository layout
+## 8. Online add-column migration
+
+`Client.add_column(table, column, ctype, default)` adds **one** column to a
+managed table while the repository stays online — no table rebuild, no
+downtime, and no rewriting of existing rows.  This is deliberately the *only*
+schema mutation beyond `create_table`: there is no drop, rename or type change,
+and no arbitrary SQL.
+
+```python
+result = c.add_column("accounts", "source_group", "text", "organic")
+# -> {"table": "accounts", "column": "source_group", "type": "text",
+#     "default": "organic", "schema_version": 2, "commit_version": 7}
+```
+
+### What existing and new data see
+
+* The migration takes one position in the **same ordered source history** that
+  carries row commits (it bumps `commit_version`).  Existing row images keep
+  their business `version`; the new column physically exists on the
+  append-only history table with a constant `DEFAULT`, so an old row reads the
+  default without being updated.  The migration is never disguised as an
+  update to every row.
+* A transaction that begins after the migration sees the new column immediately.
+  An `insert` that omits it, or an `update` that does not name it, receives the
+  same default.  An explicitly supplied value is validated by the usual typed
+  domain rules (an ill-typed value is rejected).
+* A transaction that began **before** the migration keeps reading under its
+  start-view column definition: it cannot see, name or filter on the new
+  column.  It may still complete its reads.  If it tries to *write* a table
+  whose structure changed after it began, the commit is refused with an
+  explicit `SchemaConflictError` (`code == "schema_conflict"`, carrying the
+  added column(s) and the migration records) and **leaves no write behind**.
+  A read-only transaction still commits (it serializes at its start view).
+* Validation is all-or-nothing.  An unknown table, a conflicting column name
+  (including `row_id`), an unsupported type, or a default that does not match
+  the domain raises `SchemaError` and leaves no half column, no catalog entry,
+  no fabricated source position and no replica-visible event.
+
+### Versioned catalog
+
+Each table's column definitions are stored as an immutable, ordered
+`table_schemas` history; every snapshot version resolves the schema effective
+at that point.  `c.table_schemas(table)` lists the schema versions and the
+position at which each took effect, and `c.schema_history(table)` returns the
+ordered `add_column` events (column, type, default and position).
+
+### How replicas transition without recopying the table
+
+* A subscription's full load is frozen to its cut.  If a migration lands while
+  the full load is still paging, the unread pages keep the **old** columns and
+  old values — they never gain the new column mid-stream.
+* After the final full page, the subscription emits a dedicated
+  `schema_change` incremental batch (with the column type and default) **before
+  any row commits that follow the migration**, so a consumer switches structure
+  first and only then applies new-structure rows.  A subscription created after
+  the migration simply describes the new columns directly in its full load.
+* On the replica, the schema switch (the local `ALTER TABLE … DEFAULT`, the
+  recorded type/default, the current position and the applied-batch id) is one
+  local transaction.  The source is acknowledged only after that commit.  If
+  the process is killed in between, reopening re-pulls the same batch; the
+  replica recognises the batch id and does not add the column twice, lose the
+  default, or interpret later rows under the old structure.
+* Schema events share the change log's retention: `cleanup_sync_history()`
+  reclaims only events at or below the slowest open subscription's
+  acknowledged position, so an unfinished full load or an unacknowledged old
+  batch always keeps the versions it still needs.  No long-lived read
+  transaction or write lock is held across pages.
+
+A runnable, real-process demonstration (paused full load, mid-stream migration,
+structural-conflict transaction, invalid-migration rollback and the
+crash/replay seam) is in `python3 -m mrtx.online_add_column_drill`.
+
+---
+
+## 9. Repository layout
 
 ```
 mrtx/
   __init__.py     public API and predicate builders
   values.py       typed domains, AST, 3-valued evaluation
   canonical.py    stable predicate/row encodings for evidence
-  store.py        SQLite schema, short transactions, bounded retry, recovery
+  store.py        SQLite schema, short transactions, bounded retry, recovery,
+                  versioned column catalog and online add_column
   engine.py       snapshots, staging, OCC validation, commit/abort, GC
-  subscription.py durable full-then-incremental cursor, retention helpers
+  subscription.py durable full-then-incremental cursor, schema-change stream
   replica.py      separate-SQLite replica with idempotent local apply
   errors.py       exception types
   drill.py        runnable transaction-level demonstration
   sync_drill.py   runnable subscription + replica demonstration
+  online_add_column_drill.py  runnable online-migration demonstration
 tests/
   support.py      temp-repo fixtures and drain helpers
   procutil.py     real OS-process harness (JSON-line pipes)
   worker.py       child process command loop (transactions and subscriptions)
   serialcheck.py  independent serializability checker (not used by mrtx)
-  test_*.py       unit, concurrency, process, subscription and replica tests
+  test_*.py       unit, concurrency, process, subscription, replica, migration tests
 docs/
   DESIGN.md       design notes, serializability argument, sync retention notes
 ```
 
 ---
 
-## 9. API quick reference
+## 10. API quick reference
 
 ```python
 from mrtx import Client, eq, lt, le, is_null, and_, or_, not_, TRUE, FALSE
-from mrtx import ConflictError, TransactionError, SchemaError, PredicateError, BusyError
+from mrtx import (ConflictError, TransactionError, SchemaError,
+                  SchemaConflictError, PredicateError, BusyError)
 
 c = Client(db_path)                      # opens/creates schema, recovers orphans
 c.create_table(name, [(col, type), ...]) # int64 | text | bool | null
 c.tables()                               # {table: {column: type}}
+c.add_column(table, column, ctype, default)
+                                         # online one-column migration; returns
+                                         # {schema_version, commit_version, ...}
+c.table_schemas(table)                   # immutable schema versions + positions
+c.schema_history(table=None)             # ordered add_column events
 
 tx = c.begin(txid=None)                  # fixes the start view; returns Transaction
 rows = tx.read(table, columns=None, where=None)

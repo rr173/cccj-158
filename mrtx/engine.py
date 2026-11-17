@@ -62,7 +62,8 @@ import time
 
 from . import canonical
 from . import subscription as subscription_mod
-from .errors import ConflictError, SchemaError, TransactionError, TransactionNotFound
+from .errors import (ConflictError, SchemaConflictError, SchemaError,
+                     TransactionError, TransactionNotFound)
 from .store import Store, hist_table
 from .values import (TYPE_BOOL, check_value, columns_used, compile_predicate,
                      returns_true)
@@ -220,6 +221,83 @@ class Client:
     def tables(self):
         return self.store.column_types()
 
+    def add_column(self, table, column, ctype, default):
+        """Add one column to a managed table while the repository stays online.
+
+        Parameters
+        ----------
+        table : str
+            An existing managed table.
+        column : str
+            The new column name (safe identifier; must not already exist and
+            must not be ``row_id``).
+        ctype : str
+            One of the supported domains (``int64`` / ``text`` / ``bool`` /
+            ``null``).
+        default :
+            A value valid for *ctype* (``None`` is allowed for every domain and
+            is the only value allowed for ``null``).  Every row committed before
+            the migration reads this default without being rewritten, and later
+            inserts that omit the column receive the same default.
+
+        Returns a durable record including the ordered source position
+        (``commit_version``) at which the migration took effect.  Raises
+        :class:`SchemaError` (with no side effects) for an unknown table, a
+        conflicting column name or an ill-typed default.
+        """
+        return self.store.add_column(table, column, ctype, default)
+
+    def schema_history(self, table=None):
+        """Ordered structural-change records (online migrations) from the source.
+
+        Each record is one entry of the same ordered history that carries row
+        commits.  Returns every table's changes when *table* is omitted.
+        """
+        def _q(conn):
+            if table is not None:
+                if conn.execute("SELECT 1 FROM tables WHERE table_name=?",
+                                (table,)).fetchone() is None:
+                    raise SchemaError("unknown table %r" % (table,))
+                sql = ("SELECT commit_version, table_name, schema_version, change_type, "
+                       "column_name, column_type, has_default, default_json, "
+                       "after_columns_json FROM schema_changes WHERE table_name=? "
+                       "ORDER BY commit_version, id")
+                params = (table,)
+            else:
+                sql = ("SELECT commit_version, table_name, schema_version, change_type, "
+                       "column_name, column_type, has_default, default_json, "
+                       "after_columns_json FROM schema_changes "
+                       "ORDER BY commit_version, id")
+                params = ()
+            out = []
+            for r in conn.execute(sql, params):
+                out.append({
+                    "commit_version": r["commit_version"], "table": r["table_name"],
+                    "schema_version": r["schema_version"], "change_type": r["change_type"],
+                    "column": r["column_name"], "type": r["column_type"],
+                    "has_default": bool(r["has_default"]),
+                    "default": json.loads(r["default_json"]),
+                    "after_columns": [c["name"] for c in
+                                      json.loads(r["after_columns_json"])]})
+            return out
+        return self.store.run_tx(_q, readonly=True)
+
+    def table_schemas(self, table):
+        """Every immutable schema version of *table* with its effective position."""
+        def _q(conn):
+            if conn.execute("SELECT 1 FROM tables WHERE table_name=?",
+                            (table,)).fetchone() is None:
+                raise SchemaError("unknown table %r" % (table,))
+            out = []
+            for r in conn.execute(
+                    "SELECT schema_version, effective_version, columns_json FROM table_schemas "
+                    "WHERE table_name=? ORDER BY schema_version", (table,)):
+                out.append({"schema_version": r["schema_version"],
+                            "effective_version": r["effective_version"],
+                            "columns": json.loads(r["columns_json"])})
+            return out
+        return self.store.run_tx(_q, readonly=True)
+
     # -- begin ---------------------------------------------------------------
 
     def begin(self, txid=None):
@@ -264,9 +342,15 @@ class Client:
     # -- materialized views --------------------------------------------------
 
     def _visible_rows(self, conn, table, version):
-        """[(row_id, version, values)] visible at *version*, ordered by row_id."""
+        """[(row_id, version, values)] visible at *version*, ordered by row_id.
+
+        The values use the *column definition effective at* *version*: an old
+        snapshot never sees columns added by a later online migration, while a
+        new snapshot reads the added column's default straight out of the
+        physical default on existing history rows (no row rewrite).
+        """
         hist = hist_table(table)
-        columns = self.store.table_info(table)
+        columns, _defaults = self.store.schema_at_conn(conn, table, version)
         rows = conn.execute(
             'SELECT h.* FROM "%s" h JOIN (SELECT row_id, MAX(version) AS mv FROM "%s" '
             'WHERE version <= ? GROUP BY row_id) v '
@@ -334,23 +418,25 @@ class Client:
     # -- read ----------------------------------------------------------------
 
     def read(self, handle, table, columns=None, where=None):
-        columns_map = self.store.table_info(table)
-        pred = compile_predicate(where, columns_map)
-        if columns is None:
-            selected = list(columns_map)
-        else:
-            if not isinstance(columns, (list, tuple)) or not columns:
-                raise SchemaError("columns must be a non-empty list of whitelisted names")
-            selected = []
-            for name in columns:
-                if name != "row_id" and name not in columns_map:
-                    raise SchemaError("unknown column %r on %s" % (name, table))
-                if name not in selected:
-                    selected.append(name)
-
         def _read(conn):
             tx = self._load(conn, handle, need_active=True)
             version = tx["base_version"]
+            # Resolve the column definition fixed at the transaction's start
+            # view.  A read never sees a column added by a later migration.
+            columns_map, _defaults = self.store.schema_at_conn(conn, table, version)
+            pred = compile_predicate(where, columns_map)
+            if columns is None:
+                selected = list(columns_map)
+            else:
+                if not isinstance(columns, (list, tuple)) or not columns:
+                    raise SchemaError("columns must be a non-empty list of whitelisted names")
+                selected = []
+                for name in columns:
+                    if name != "row_id" and name not in columns_map:
+                        raise SchemaError("unknown column %r on %s" % (name, table))
+                    if name not in selected:
+                        selected.append(name)
+
             view = self._view(conn, handle.txid, table, version)
             out = []
             for rid in sorted(view):
@@ -409,7 +495,6 @@ class Client:
     def _stage(self, handle, table, row_id, values, expected_version, kind):
         if not isinstance(row_id, str) or not row_id:
             raise SchemaError("row_id must be a non-empty string")
-        columns_map = self.store.table_info(table)
         if expected_version is not None and (
                 isinstance(expected_version, bool) or not isinstance(expected_version, int)
                 or expected_version < 0):
@@ -417,27 +502,48 @@ class Client:
         if kind in ("insert", "update"):
             if not isinstance(values, dict):
                 raise SchemaError("%s requires a values dict" % kind)
-            unknown = set(values) - set(columns_map)
-            if unknown:
-                raise SchemaError("unknown columns on %s: %s" % (table, sorted(unknown)))
-            if kind == "insert":
-                payload = {}
-                for name, ctype in columns_map.items():
-                    value = values.get(name)
-                    check_value(value, ctype, "%s.%s" % (table, name))
-                    payload[name] = value
-            else:
-                if not values:
-                    raise SchemaError("update values must not be empty")
-                for name, value in values.items():
-                    check_value(value, columns_map[name], "%s.%s" % (table, name))
-                payload = dict(values)
-        else:
-            payload = None
 
         def _do(conn):
             self._load(conn, handle, need_active=True)
             base_version = self._load(conn, handle)["base_version"]
+            # The transaction's structural start view: the column definition
+            # (and declared defaults) fixed at begin time.
+            columns_map, default_map = self.store.schema_at_conn(
+                conn, table, base_version)
+            live_types, _live_defaults, _cols = self.store.latest_schema_conn(
+                conn, table)
+            if kind in ("insert", "update"):
+                unknown = set(values) - set(columns_map)
+                if unknown:
+                    raise SchemaError("unknown columns on %s: %s" % (table, sorted(unknown)))
+                if kind == "insert":
+                    payload = {}
+                    for name, ctype in columns_map.items():
+                        if name in values:
+                            value = values[name]
+                        else:
+                            # An omitted column uses its declared default (the
+                            # value an online migration gave existing rows).
+                            value = default_map.get(name)
+                        check_value(value, ctype, "%s.%s" % (table, name))
+                        payload[name] = value
+                else:
+                    if not values:
+                        raise SchemaError("update values must not be empty")
+                    for name, value in values.items():
+                        check_value(value, columns_map[name], "%s.%s" % (table, name))
+                    payload = dict(values)
+            else:
+                payload = None
+
+            # Structural conflict: the table's column definition changed after
+            # this transaction's start view (an online add_column landed).  Its
+            # reads keep the old definition, but a write against a migrated
+            # table is refused explicitly and leaves no write behind.
+            if set(columns_map) != set(live_types):
+                self._raise_schema_conflict(conn, handle, table, base_version,
+                                            columns_map, live_types)
+
             snap_view = {rid: {"version": ver, "values": vals}
                          for rid, ver, vals in self._visible_rows(conn, table, base_version)}
             staged = {rid: eff for rid, eff in self._staged_for_table(conn, handle.txid, table)}
@@ -534,6 +640,43 @@ class Client:
         return conn.execute("SELECT local_counter FROM transactions WHERE user_txid=?",
                             (txid,)).fetchone()[0]
 
+    def _raise_schema_conflict(self, conn, handle, table, base_version,
+                               snapshot_columns, live_columns):
+        """Build evidence for a write against a table migrated after begin.
+
+        Nothing has been written when this runs; the exception itself is the
+        explicit structural-conflict result and no staging row is produced.
+        """
+        changes = [dict(r) for r in conn.execute(
+            "SELECT commit_version, table_name, schema_version, change_type, column_name, "
+            "column_type, default_json, after_columns_json FROM schema_changes "
+            "WHERE table_name=? AND commit_version > ? ORDER BY commit_version",
+            (table, base_version))]
+        for ch in changes:
+            ch["default"] = json.loads(ch.pop("default_json"))
+            ch["after_columns"] = [c["name"] for c in
+                                   json.loads(ch.pop("after_columns_json"))]
+        added = sorted(set(live_columns) - set(snapshot_columns))
+        evidence = {
+            "code": "schema_conflict",
+            "transaction": handle.txid,
+            "table": table,
+            "snapshot_version": base_version,
+            "current_version": Store.current_commit_version(conn),
+            "columns_at_snapshot": list(snapshot_columns),
+            "columns_now": list(live_columns),
+            "added_columns": added,
+            "migrations": changes,
+            "summary": "table %r changed structure (added column(s) %s) after transaction %s "
+                       "began at version %s; reads keep the old definition but the write is "
+                       "refused with no effect"
+                       % (table, added, handle.txid, base_version),
+        }
+        raise SchemaConflictError(
+            "schema conflict: transaction %s writes %s whose columns changed "
+            "after its start view" % (handle.txid, table),
+            "schema_conflict", evidence)
+
     # -- commit --------------------------------------------------------------
 
     def commit(self, handle):
@@ -571,6 +714,18 @@ class Client:
         if problems:
             return self._record_rejection(conn, handle, base_version, problems)
 
+        # Defensive structural guard: staging normally refuses a migrated table
+        # already, but check again inside this atomic transaction so a migration
+        # landing after the last stage still cannot produce a malformed write.
+        for table in [r[0] for r in conn.execute(
+                "SELECT DISTINCT table_name FROM staged WHERE user_txid=? ORDER BY table_name",
+                (handle.txid,))]:
+            snap_types, _d = self.store.schema_at_conn(conn, table, base_version)
+            live_types, _ld, _c = self.store.latest_schema_conn(conn, table)
+            if set(snap_types) != set(live_types):
+                self._raise_schema_conflict(conn, handle, table, base_version,
+                                            snap_types, live_types)
+
         commit_version = Store.bump_commit_version(conn)
         writes = []
         ordinal = 0
@@ -582,7 +737,10 @@ class Client:
             "SELECT DISTINCT table_name FROM staged WHERE user_txid=? ORDER BY table_name",
             (handle.txid,))]
         for table in tables:
-            columns_map = self.store.table_info(table)
+            # The guard above already proved this table did not change after
+            # the transaction's start view, so its snapshot column set is the
+            # one its staged values conform to.
+            columns_map, _d = self.store.schema_at_conn(conn, table, base_version)
             for rid, eff in self._staged_for_table(conn, handle.txid, table):
                 ordinal += 1
                 new_values = eff["new_values"]
@@ -1110,7 +1268,8 @@ class Client:
 
     def history(self, table, row_id):
         def _q(conn):
-            columns = self.store.table_info(table)
+            current = Store.current_commit_version(conn)
+            columns, _defaults = self.store.schema_at_conn(conn, table, current)
             rows = conn.execute(
                 'SELECT * FROM "%s" WHERE row_id=? ORDER BY version' % hist_table(table),
                 (row_id,)).fetchall()

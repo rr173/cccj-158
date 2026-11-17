@@ -15,15 +15,16 @@ Properties
 """
 
 import os
+import json
 import random
 import re
 import sqlite3
 import time
 
 from .errors import BusyError, InternalInvariantError, SchemaError
-from .values import COLUMN_TYPES
+from .values import COLUMN_TYPES, check_value, TYPE_BOOL, TYPE_INT, TYPE_TEXT, TYPE_NULL
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 
@@ -144,6 +145,7 @@ BASE_DDL = [
         cut_version INTEGER NOT NULL,
         tables_json TEXT NOT NULL,       -- code-point-sorted subscribed tables
         schema_json TEXT NOT NULL,       -- frozen descriptors of those tables
+        schema_defaults_json TEXT NOT NULL DEFAULT '{}', -- frozen declared defaults
         token_hash TEXT NOT NULL,
         full_done INTEGER NOT NULL,      -- the S full load has been delivered
         ack_version INTEGER NOT NULL,    -- last acknowledged source position
@@ -197,6 +199,40 @@ BASE_DDL = [
     """,
     "CREATE INDEX IF NOT EXISTS sub_changes_by_version ON sub_changes(commit_version, id)",
     "CREATE INDEX IF NOT EXISTS sub_changes_by_table ON sub_changes(table_name, commit_version)",
+    # -- versioned column catalog (online add-column) -------------------------
+    # One immutable row per *table schema version*.  The initial schema (the
+    # create_table shape) is version 1; every online add_column appends a new
+    # row with the next per-table version.  ``effective_version`` is the
+    # monotonically ordered source commit version at which the schema took
+    # effect, so a snapshot at V resolves the newest row whose effective
+    # version <= V.  Business row history is never rewritten by a migration.
+    """
+    CREATE TABLE IF NOT EXISTS table_schemas (
+        table_name TEXT NOT NULL,
+        schema_version INTEGER NOT NULL,
+        effective_version INTEGER NOT NULL,
+        columns_json TEXT NOT NULL,        -- ordered [{name, type, has_default, default}]
+        PRIMARY KEY (table_name, schema_version))
+    """,
+    # The ordered source history of structural changes.  Written in the same
+    # atomic migration transaction that bumps commit_version, so a schema
+    # change and the row commits share one ordering stream and a failed
+    # migration can never leave an event (or a fabricated position) behind.
+    """
+    CREATE TABLE IF NOT EXISTS schema_changes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        commit_version INTEGER NOT NULL,
+        table_name TEXT NOT NULL,
+        schema_version INTEGER NOT NULL,
+        change_type TEXT NOT NULL,        -- only "add_column" is ever written
+        column_name TEXT NOT NULL,
+        column_type TEXT NOT NULL,
+        has_default INTEGER NOT NULL,
+        default_json TEXT,
+        after_columns_json TEXT NOT NULL)
+    """,
+    "CREATE INDEX IF NOT EXISTS schema_changes_by_version ON schema_changes(commit_version, id)",
+    "CREATE INDEX IF NOT EXISTS schema_changes_by_table ON schema_changes(table_name, commit_version)",
 ]
 
 
@@ -325,9 +361,40 @@ class Store:
                              (str(SCHEMA_VERSION),))
                 conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('seq', '0')")
                 conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('commit_version', '0')")
-            elif int(row[0]) == 1:
-                # v1 -> v2 only adds the subscription tables; BASE_DDL has
-                # already created them with IF NOT EXISTS.
+            elif int(row[0]) in (1, 2):
+                # v1 -> v2 added the subscription tables; v2 -> v3 adds the
+                # versioned column catalog and the schema-change log.  New
+                # tables are created above with IF NOT EXISTS, but an existing
+                # subscriptions table still needs the defaults column added.
+                sub_cols = {r[1] for r in conn.execute(
+                    "PRAGMA table_info(subscriptions)")}
+                if "schema_defaults_json" not in sub_cols:
+                    conn.execute(
+                        "ALTER TABLE subscriptions ADD COLUMN "
+                        "schema_defaults_json TEXT NOT NULL DEFAULT '{}'")
+                # Backfill one immutable schema row per existing table from the
+                # current catalog, so older repositories keep their history
+                # without a rewrite.
+                existing = {r[0] for r in conn.execute(
+                    "SELECT table_name FROM table_schemas")}
+                for tname, in conn.execute(
+                        "SELECT table_name FROM tables ORDER BY table_name"):
+                    if tname in existing:
+                        continue
+                    cols = [{"name": r[0], "type": r[1], "has_default": False}
+                            for r in conn.execute(
+                                "SELECT column_name, column_type FROM table_columns "
+                                "WHERE table_name=? ORDER BY position", (tname,))]
+                    # The legacy table carried these columns for its entire
+                    # history, so schema version 1 is visible at every snapshot
+                    # (effective position 0), including in-flight transactions
+                    # whose base_version predates this upgrade.
+                    conn.execute(
+                        "INSERT INTO table_schemas(table_name, schema_version, "
+                        "effective_version, columns_json) VALUES (?, 1, 0, ?)",
+                        (tname, json.dumps(cols, sort_keys=True)))
+                    conn.execute("UPDATE tables SET version=1 WHERE table_name=?",
+                                 (tname,))
                 conn.execute("UPDATE meta SET value=? WHERE key='schema_version'",
                              (str(SCHEMA_VERSION),))
             elif int(row[0]) != SCHEMA_VERSION:
@@ -374,21 +441,34 @@ class Store:
             conn.execute('CREATE TABLE "%s" (%s)' % (hist, ", ".join(coldefs)))
             conn.execute('CREATE INDEX IF NOT EXISTS "%s_v" ON "%s"(row_id, version DESC)'
                          % (hist, hist))
-            conn.execute("INSERT INTO tables(table_name, version) VALUES (?, 0)", (table,))
+            conn.execute("INSERT INTO tables(table_name, version) VALUES (?, 1)", (table,))
             for pos, (name, ctype) in enumerate(columns):
                 conn.execute(
                     "INSERT INTO table_columns(table_name, position, column_name, column_type) "
                     "VALUES (?, ?, ?, ?)", (table, pos, name, ctype))
+            # The immutable schema version 1 is visible from the very first
+            # snapshot (effective position 0).  create_table does not consume a
+            # commit-version position, and a transaction beginning immediately
+            # afterwards has base_version 0, so the table must resolve there.
+            schema_cols = [{"name": name, "type": ctype, "has_default": False}
+                           for name, ctype in columns]
+            conn.execute(
+                "INSERT INTO table_schemas(table_name, schema_version, effective_version, "
+                "columns_json) VALUES (?, 1, 0, ?)",
+                (table, json.dumps(schema_cols, sort_keys=True)))
         self.run_tx(_create)
         return self.table_info(table)
 
     def column_types(self):
+        """Current (latest) declared column types for every managed table."""
         def _read(conn):
             out = {}
-            for tname, cname, ctype in conn.execute(
-                    "SELECT table_name, column_name, column_type FROM table_columns "
-                    "ORDER BY table_name, position"):
-                out.setdefault(tname, {})[cname] = ctype
+            for r in conn.execute(
+                    "SELECT table_name, columns_json FROM table_schemas ts "
+                    "WHERE schema_version = (SELECT MAX(schema_version) FROM table_schemas "
+                    "WHERE table_name = ts.table_name) ORDER BY table_name"):
+                cols = json.loads(r["columns_json"])
+                out[r["table_name"]] = {c["name"]: c["type"] for c in cols}
             return out
         return self.run_tx(_read, readonly=True)
 
@@ -397,6 +477,149 @@ class Store:
         if table not in cols:
             raise SchemaError("unknown table %r" % (table,))
         return cols[table]
+
+    # -- versioned column catalog --------------------------------------------
+
+    @staticmethod
+    def _schema_columns(conn, table, version):
+        """Ordered column descriptors of *table* visible at snapshot *version*.
+
+        Returns ``None`` when the table has no schema effective at that
+        position (it did not exist yet).
+        """
+        row = conn.execute(
+            "SELECT columns_json FROM table_schemas WHERE table_name=? AND effective_version <= ? "
+            "ORDER BY schema_version DESC LIMIT 1", (table, version)).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["columns_json"])
+
+    @staticmethod
+    def _schema_parts(cols):
+        types = {c["name"]: c["type"] for c in cols}
+        defaults = {c["name"]: c.get("default") for c in cols if c.get("has_default")}
+        return types, defaults
+
+    def schema_at_conn(self, conn, table, version):
+        """Connection-local version of :meth:`schema_at` (no new transaction)."""
+        cols = self._schema_columns(conn, table, version)
+        if cols is None:
+            raise SchemaError("unknown table %r at version %s" % (table, version))
+        return self._schema_parts(cols)
+
+    def latest_schema_conn(self, conn, table):
+        """Connection-local ``(types, defaults, descriptors)`` for the table."""
+        if conn.execute("SELECT 1 FROM tables WHERE table_name=?",
+                        (table,)).fetchone() is None:
+            raise SchemaError("unknown table %r" % (table,))
+        cols = self._schema_columns(conn, table,
+                                    Store.current_commit_version(conn))
+        types, defaults = self._schema_parts(cols)
+        return types, defaults, cols
+
+    def schema_at(self, table, version):
+        """``(ordered {name: type}, {name: default_value})`` at *version*.
+
+        The type map preserves declaration order; the default map contains
+        exactly the columns whose default was declared (which, in this product,
+        are precisely the columns added online).  Raises :class:`SchemaError`
+        if the table does not exist at that snapshot.
+        """
+        def _q(conn):
+            return self.schema_at_conn(conn, table, version)
+        return self.run_tx(_q, readonly=True)
+
+    def latest_schema(self, table):
+        def _q(conn):
+            return self.latest_schema_conn(conn, table)
+        return self.run_tx(_q, readonly=True)
+
+    @staticmethod
+    def _sql_literal(value, ctype):
+        """Render an already-validated Python default as a SQL literal.
+
+        Identifiers are quoted separately; only validated, JSON-typed domain
+        values ever reach here, so the literal cannot carry SQL text.
+        """
+        if value is None:
+            return "NULL"
+        if ctype == TYPE_TEXT:
+            return "'" + value.replace("'", "''") + "'"
+        if ctype == TYPE_BOOL:
+            return "1" if value else "0"
+        if ctype == TYPE_INT:
+            return str(int(value))
+        raise SchemaError("type %s cannot carry a non-null default" % ctype)
+
+    def add_column(self, table, column, ctype, default):
+        """Online add-column migration in one atomic short transaction.
+
+        Appends one immutable schema version, physically extends the append-only
+        history table with a constant default, records an ordered
+        ``schema_changes`` event and bumps the source position -- all together,
+        so a failure rolls back the whole migration and leaves no half column,
+        no event and no fabricated source position.  Existing row images keep
+        their business versions; the new column reads back as *default* without
+        any row being rewritten.
+        """
+        self.check_ident(table, "table name")
+        self.check_ident(column, "column name")
+        if ctype not in COLUMN_TYPES:
+            raise SchemaError("unsupported column type %r" % (ctype,))
+        # Validate the default against the declared domain *before* opening any
+        # write transaction, so a bad default has no side effects at all.
+        check_value(default, ctype, "default for %s.%s" % (table, column))
+
+        def _migrate(conn):
+            if conn.execute("SELECT 1 FROM tables WHERE table_name=?",
+                            (table,)).fetchone() is None:
+                raise SchemaError("unknown table %r" % (table,))
+            latest = conn.execute(
+                "SELECT schema_version, columns_json FROM table_schemas "
+                "WHERE table_name=? ORDER BY schema_version DESC LIMIT 1",
+                (table,)).fetchone()
+            if latest is None:
+                raise InternalInvariantError(
+                    "table %r has no versioned schema row; the repository catalog "
+                    "is inconsistent" % table)
+            cols = json.loads(latest["columns_json"])
+            names = {c["name"] for c in cols}
+            if column in names or column == "row_id":
+                raise SchemaError("column %s.%s already exists" % (table, column))
+            next_schema_version = int(latest["schema_version"]) + 1
+            new_cols = list(cols) + [{"name": column, "type": ctype,
+                                      "has_default": True, "default": default}]
+            # One ordered position in the shared source history.
+            effective = Store.bump_commit_version(conn)
+            decl = {TYPE_INT: "INTEGER", TYPE_TEXT: "TEXT", TYPE_BOOL: "INTEGER",
+                    TYPE_NULL: ""}[ctype]
+            literal = self._sql_literal(default, ctype)
+            ddl = 'ALTER TABLE "%s_rows" ADD COLUMN "%s" %s DEFAULT %s' % (
+                table, column, decl, literal)
+            conn.execute(ddl)
+            conn.execute(
+                "INSERT INTO table_schemas(table_name, schema_version, effective_version, "
+                "columns_json) VALUES (?, ?, ?, ?)",
+                (table, next_schema_version, effective,
+                 json.dumps(new_cols, sort_keys=True)))
+            conn.execute("UPDATE tables SET version=? WHERE table_name=?",
+                         (next_schema_version, table))
+            # Keep the flat catalog current for existing tooling.
+            conn.execute(
+                "INSERT INTO table_columns(table_name, position, column_name, column_type) "
+                "VALUES (?, ?, ?, ?)",
+                (table, len(cols), column, ctype))
+            conn.execute(
+                "INSERT INTO schema_changes(commit_version, table_name, schema_version, "
+                "change_type, column_name, column_type, has_default, default_json, "
+                "after_columns_json) VALUES (?, ?, ?, 'add_column', ?, ?, 1, ?, ?)",
+                (effective, table, next_schema_version, column, ctype,
+                 json.dumps(default, sort_keys=True),
+                 json.dumps(new_cols, sort_keys=True)))
+            return {"table": table, "column": column, "type": ctype,
+                    "default": default, "schema_version": next_schema_version,
+                    "commit_version": effective}
+        return self.run_tx(_migrate)
 
     # -- counters ------------------------------------------------------------
 

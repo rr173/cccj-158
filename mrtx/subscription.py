@@ -148,6 +148,15 @@ def _sub_row(conn, sub_id):
                         (sub_id,)).fetchone()
 
 
+def _row_defaults(row):
+    """Tolerate rows written before the defaults column existed."""
+    try:
+        text = row["schema_defaults_json"]
+    except (IndexError, KeyError):
+        return {}
+    return json.loads(text) if text else {}
+
+
 def _check_handle(conn, handle):
     """Authenticate a handle against its durable row; raise on mismatch.
 
@@ -167,19 +176,42 @@ def _check_handle(conn, handle):
     return row
 
 
-def _frozen_schema(store, tables):
+def _frozen_schema(store, tables, conn=None):
+    """Freeze the current column types *and* declared defaults of the tables.
+
+    Returns ``(types, defaults)``.  The type map is keyed exactly as before so
+    existing consumers keep working; the parallel default map carries the value
+    of every column that was added online with a default.  When *conn* is given
+    the catalog is read on that open connection (used inside a write tx);
+    otherwise a short read transaction is opened.
+    """
+    if conn is not None:
+        types = {}
+        defaults = {}
+        for table in tables:
+            _lt, tdefault, descriptors = store.latest_schema_conn(conn, table)
+            types[table] = {d["name"]: d["type"] for d in descriptors}
+            defaults[table] = tdefault
+        return types, defaults
+
     columns = store.column_types()
-    out = {}
+    types = {}
+    defaults = {}
     for table in tables:
         if table not in columns:
             raise SchemaError("subscription names unknown table %r" % (table,))
-        out[table] = cols = {}
-        for name, ctype in columns[table].items():
+        types[table] = cols = {}
+        defaults[table] = tdefs = {}
+        _lt, tdefault, descriptors = store.latest_schema(table)
+        for desc in descriptors:
+            name, ctype = desc["name"], desc["type"]
             if ctype not in COLUMN_TYPES:
                 raise SchemaError("table %s has unsupported column type %r"
                                   % (table, ctype))
             cols[name] = ctype
-    return out
+            if desc.get("has_default"):
+                tdefs[name] = desc.get("default")
+    return types, defaults
 
 
 def _now():
@@ -202,7 +234,7 @@ def create(client, name, tables):
     if len(set(tables)) != len(tables):
         raise SchemaError("duplicate table in subscription")
     ordered = _sorted_tables(tables)
-    frozen = _frozen_schema(client.store, ordered)
+    frozen, frozen_defaults = _frozen_schema(client.store, ordered)
     sub_id = new_sub_id()
     token = secrets.token_hex(24)
     now = _now()
@@ -213,12 +245,13 @@ def create(client, name, tables):
         cut = Store.current_commit_version(conn)
         conn.execute(
             "INSERT INTO subscriptions(sub_id, name, state, generation, cut_version, "
-            "tables_json, schema_json, token_hash, full_done, ack_version, "
-            "full_cursor_table, full_cursor_row, last_acked_batch, last_acked_position, "
-            "created_wall, updated_wall) "
-            "VALUES (?, ?, ?, 1, ?, ?, ?, ?, 0, ?, ?, '', NULL, NULL, ?, ?)",
+            "tables_json, schema_json, schema_defaults_json, token_hash, full_done, "
+            "ack_version, full_cursor_table, full_cursor_row, last_acked_batch, "
+            "last_acked_position, created_wall, updated_wall) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, ?, '', NULL, NULL, ?, ?)",
             (sub_id, name, ACTIVE, cut,
              json.dumps(ordered), json.dumps(frozen, sort_keys=True),
+             json.dumps(frozen_defaults, sort_keys=True),
              _hash_token(token), cut, ordered[0], now, now))
         return cut
     cut = client.store.run_tx(_create)
@@ -265,6 +298,7 @@ def status(client, handle):
             "cut_version": row["cut_version"],
             "tables": json.loads(row["tables_json"]),
             "schema": json.loads(row["schema_json"]),
+            "schema_defaults": _row_defaults(row),
             "phase": PHASE_INCREMENTAL if row["full_done"] else PHASE_FULL,
             "full_done": bool(row["full_done"]),
             "acknowledged_position": row["ack_version"],
@@ -323,6 +357,7 @@ def _fetch_full_page(conn, table, columns, cut, after_row, limit):
 def _build_full(conn, handle, row, max_rows):
     tables = json.loads(row["tables_json"])
     schema = json.loads(row["schema_json"])
+    defaults = _row_defaults(row)
     cut = row["cut_version"]
     start_table = row["full_cursor_table"] or tables[0]
     start_row = row["full_cursor_row"] or ""
@@ -360,7 +395,8 @@ def _build_full(conn, handle, row, max_rows):
         "full_complete": full_complete,
         "cursor": cursor,
         "row_count": len(items),
-        "tables": [{"table": t, "columns": schema[t]} for t in tables],
+        "tables": _table_specs(tables, schema, defaults),
+        "schema_defaults": defaults,
     }
     _store_pending(conn, handle.sub_id, batch_id, row["generation"], PHASE_FULL,
                    cut, cut, 1 if full_complete else 0, manifest, items)
@@ -368,19 +404,109 @@ def _build_full(conn, handle, row, max_rows):
     return {"batch": manifest, "caught_up": False}
 
 
+def _table_specs(tables, schema, defaults):
+    """Wire descriptor per table: column types plus declared defaults."""
+    return [{"table": t, "columns": schema[t],
+             "defaults": defaults.get(t, {})} for t in tables]
+
+
+def _next_event(conn, tables, ack):
+    """The earliest source event (schema change or row change) past *ack*.
+
+    Structural changes and row changes live in the same ordered commit stream.
+    A migration commit never also writes rows, so the earliest position belongs
+    to exactly one kind.
+    """
+    marks = ", ".join("?" for _ in tables)
+    nxt_change = conn.execute(
+        "SELECT MIN(commit_version) FROM sub_changes WHERE commit_version > ? "
+        "AND table_name IN (%s)" % marks, (ack, *tables)).fetchone()[0]
+    nxt_schema = conn.execute(
+        "SELECT MIN(commit_version) FROM schema_changes WHERE commit_version > ? "
+        "AND table_name IN (%s)" % marks, (ack, *tables)).fetchone()[0]
+    candidates = [v for v in (nxt_change, nxt_schema) if v is not None]
+    return min(candidates) if candidates else None
+
+
+def _build_schema_batch(conn, handle, row, position, tables):
+    """One incremental batch describing the structural change at *position*."""
+    schema_rows = conn.execute(
+        "SELECT * FROM schema_changes WHERE commit_version=? AND table_name IN (%s) "
+        "ORDER BY id" % ", ".join("?" for _ in tables),
+        (position, *tables)).fetchall()
+    events = []
+    for r in schema_rows:
+        after_cols = json.loads(r["after_columns_json"])
+        events.append({
+            "kind": "schema_change",
+            "table": r["table_name"],
+            "change_type": r["change_type"],
+            "column": r["column_name"],
+            "column_type": r["column_type"],
+            "has_default": bool(r["has_default"]),
+            "default": json.loads(r["default_json"]),
+            "schema_version": r["schema_version"],
+            "after_columns": [c["name"] for c in after_cols],
+            "after_columns_full": after_cols,
+        })
+    batch_id = "b-" + secrets.token_hex(12)
+    # The frozen full-load schema, advanced to describe the migrated tables.
+    schema = _schema_after_events(json.loads(row["schema_json"]), events)
+    defaults = _defaults_after_events(_row_defaults(row), events)
+    manifest = {
+        "subscription_id": handle.sub_id,
+        "generation": row["generation"],
+        "batch_id": batch_id,
+        "phase": PHASE_INCREMENTAL,
+        "kind": "schema_change",
+        "from_position": row["ack_version"],
+        "position": position,
+        "full_complete": False,
+        "row_count": len(events),
+        "tables": _table_specs(tables, schema, defaults),
+        "schema_defaults": defaults,
+        "schema_events": [{k: v for k, v in e.items()
+                           if k != "after_columns_full"} for e in events],
+    }
+    _store_pending(conn, handle.sub_id, batch_id, row["generation"],
+                   PHASE_INCREMENTAL, row["ack_version"], position, 0,
+                   manifest, events)
+    manifest["items"] = events
+    return {"batch": manifest, "caught_up": False}
+
+
+def _schema_after_events(schema, events):
+    out = {t: dict(cols) for t, cols in schema.items()}
+    for e in events:
+        out.setdefault(e["table"], {})[e["column"]] = e["column_type"]
+    return out
+
+
+def _defaults_after_events(defaults, events):
+    out = {t: dict(d) for t, d in defaults.items()}
+    for e in events:
+        if e["has_default"]:
+            out.setdefault(e["table"], {})[e["column"]] = e["default"]
+    return out
+
+
 def _build_incremental(conn, handle, row):
     tables = json.loads(row["tables_json"])
     schema = json.loads(row["schema_json"])
+    defaults = _row_defaults(row)
     ack = row["ack_version"]
-    marks = ", ".join("?" for _ in tables)
-    nxt = conn.execute(
-        "SELECT MIN(commit_version) FROM sub_changes WHERE commit_version > ? "
-        "AND table_name IN (%s)" % marks, (ack, *tables)).fetchone()[0]
+    nxt = _next_event(conn, tables, ack)
     current = Store.current_commit_version(conn)
     if nxt is None:
         return {"batch": None, "caught_up": True,
                 "acknowledged_position": ack,
                 "current_source_position": current}
+    schema_at = conn.execute(
+        "SELECT 1 FROM schema_changes WHERE commit_version=? AND table_name IN (%s) LIMIT 1"
+        % ", ".join("?" for _ in tables), (nxt, *tables)).fetchone()
+    if schema_at is not None:
+        return _build_schema_batch(conn, handle, row, nxt, tables)
+    marks = ", ".join("?" for _ in tables)
     changes = conn.execute(
         "SELECT * FROM sub_changes WHERE commit_version=? AND table_name IN (%s) "
         "ORDER BY id" % marks, (nxt, *tables)).fetchall()
@@ -403,11 +529,13 @@ def _build_incremental(conn, handle, row):
         "generation": row["generation"],
         "batch_id": batch_id,
         "phase": PHASE_INCREMENTAL,
+        "kind": "row_change",
         "from_position": ack,
         "position": nxt,
         "full_complete": False,
         "row_count": len(items),
-        "tables": [{"table": t, "columns": schema[t]} for t in tables],
+        "tables": _table_specs(tables, schema, defaults),
+        "schema_defaults": defaults,
     }
     _store_pending(conn, handle.sub_id, batch_id, row["generation"], PHASE_INCREMENTAL,
                    ack, nxt, 0, manifest, items)
@@ -547,12 +675,19 @@ def rebuild(client, handle):
         generation = row["generation"] + 1
         cut = Store.current_commit_version(conn)
         tables = json.loads(row["tables_json"])
+        # Re-freeze against the current catalog: a generation taken after a
+        # migration describes the new columns directly in its full load.
+        frozen, frozen_defaults = _frozen_schema(client.store, tables, conn=conn)
         conn.execute(
             "UPDATE subscriptions SET state=?, generation=?, cut_version=?, "
-            "token_hash=?, full_done=0, ack_version=?, full_cursor_table=?, "
-            "full_cursor_row='', last_acked_batch=NULL, last_acked_position=NULL, "
-            "updated_wall=? WHERE sub_id=?",
-            (ACTIVE, generation, cut, _hash_token(token), cut, tables[0],
+            "schema_json=?, schema_defaults_json=?, token_hash=?, full_done=0, "
+            "ack_version=?, full_cursor_table=?, full_cursor_row='', "
+            "last_acked_batch=NULL, last_acked_position=NULL, updated_wall=? "
+            "WHERE sub_id=?",
+            (ACTIVE, generation, cut,
+             json.dumps(frozen, sort_keys=True),
+             json.dumps(frozen_defaults, sort_keys=True),
+             _hash_token(token), cut, tables[0],
              _now(), handle.sub_id))
         conn.execute("DELETE FROM subscription_pending WHERE sub_id=?", (handle.sub_id,))
         conn.execute("DELETE FROM subscription_items WHERE sub_id=?", (handle.sub_id,))
@@ -615,11 +750,19 @@ def cleanup_sync_history(client):
         current = Store.current_commit_version(conn)
         if boundary is None:
             reclaimed = conn.execute("DELETE FROM sub_changes").rowcount
+            reclaimed_schema = conn.execute("DELETE FROM schema_changes").rowcount
             boundary_reported = current
         else:
             reclaimed = conn.execute(
                 "DELETE FROM sub_changes WHERE commit_version <= ?", (boundary,)
             ).rowcount
+            # Structural events are part of the same ordered stream; the slowest
+            # open subscription's acknowledged position bounds them too.  An
+            # event a subscription still has to see (its cut predates the
+            # migration) is never below that boundary.
+            reclaimed_schema = conn.execute(
+                "DELETE FROM schema_changes WHERE commit_version <= ?",
+                (boundary,)).rowcount
             boundary_reported = boundary
         # Private pending copies of closed subscriptions are garbage.
         closed = [r[0] for r in conn.execute(
@@ -631,10 +774,14 @@ def cleanup_sync_history(client):
             released += conn.execute(
                 "DELETE FROM subscription_items WHERE sub_id=?", (sub_id,)).rowcount
         remaining = conn.execute("SELECT COUNT(*) FROM sub_changes").fetchone()[0]
+        remaining_schema = conn.execute(
+            "SELECT COUNT(*) FROM schema_changes").fetchone()[0]
         return {"reclaimed_changes": reclaimed,
+                "reclaimed_schema_changes": reclaimed_schema,
                 "retention_boundary": boundary_reported,
                 "current_source_position": current,
                 "remaining_changes": remaining,
+                "remaining_schema_changes": remaining_schema,
                 "released_pending_rows": released,
                 "open_subscriptions": conn.execute(
                     "SELECT COUNT(*) FROM subscriptions WHERE state=?",

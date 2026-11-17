@@ -87,6 +87,13 @@ class Worker:
         assert out["ok"], out
         return out
 
+    def add_column(self, table, column, ctype, default):
+        return self.send({"cmd": "add_column", "table": table,
+                          "column": column, "type": ctype, "default": default})
+
+    def schema_history(self, table=None):
+        return self.send({"cmd": "schema_history", "table": table})["result"]
+
     def pull(self, handle, max_rows=100):
         return self.send({"cmd": "pull", "handle": handle,
                           "max_rows": max_rows})

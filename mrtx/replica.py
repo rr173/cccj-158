@@ -94,7 +94,30 @@ class Replica:
     def _tables(self, conn):
         return json.loads(self._meta(conn, "tables_json", "{}"))
 
-    def _ensure_data_tables(self, conn, tables, schema, reset):
+    def _schema(self, conn):
+        """Current local column types (``{table: {col: type}}``)."""
+        return json.loads(self._meta(conn, "schema_json", "{}"))
+
+    def _defaults(self, conn):
+        """Current local declared defaults (``{table: {col: value}}``)."""
+        return json.loads(self._meta(conn, "schema_defaults_json", "{}"))
+
+    @staticmethod
+    def _decl(ctype):
+        return {"int64": "INTEGER", "text": "TEXT", "bool": "INTEGER",
+                "null": ""}[ctype]
+
+    @staticmethod
+    def _literal(value, ctype):
+        if value is None:
+            return "NULL"
+        if ctype == "text":
+            return "'" + str(value).replace("'", "''") + "'"
+        if ctype == "bool":
+            return "1" if value else "0"
+        return str(int(value))
+
+    def _ensure_data_tables(self, conn, tables, schema, defaults, reset):
         for table, columns in schema.items():
             exists = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -104,11 +127,55 @@ class Replica:
             if exists:
                 conn.execute('DROP TABLE "%s"' % table)
             defs = ["row_id TEXT PRIMARY KEY", "version INTEGER NOT NULL"]
+            tdefs = defaults.get(table, {})
             for name, ctype in columns.items():
-                decl = {"int64": "INTEGER", "text": "TEXT", "bool": "INTEGER",
-                        "null": ""}[ctype]
-                defs.append('"%s" %s' % (name, decl) if decl else '"%s"' % name)
+                if name in tdefs:
+                    defs.append('"%s" %s DEFAULT %s'
+                                % (name, self._decl(ctype),
+                                   self._literal(tdefs[name], ctype)))
+                else:
+                    decl = self._decl(ctype)
+                    defs.append('"%s" %s' % (name, decl) if decl else '"%s"' % name)
             conn.execute('CREATE TABLE "%s" (%s)' % (table, ", ".join(defs)))
+
+    def _apply_schema_change(self, conn, event):
+        """Apply one structural event to the local replica (in the local tx)."""
+        table = event["table"]
+        column = event["column"]
+        ctype = event["column_type"]
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (table,)).fetchone()
+        if not exists:
+            raise ReplicaError(
+                "schema change references unknown replica table %r" % table)
+        already = conn.execute(
+            "SELECT 1 FROM pragma_table_info(?) WHERE name=?",
+            (table, column)).fetchone()
+        if already:
+            # Idempotent redelivery: the column is already there; do not ALTER
+            # again, just make sure the recorded default/schema are current.
+            pass
+        else:
+            if event["has_default"]:
+                ddl = 'ALTER TABLE "%s" ADD COLUMN "%s" %s DEFAULT %s' % (
+                    table, column, self._decl(ctype),
+                    self._literal(event["default"], ctype))
+            else:
+                decl = self._decl(ctype)
+                ddl = 'ALTER TABLE "%s" ADD COLUMN "%s" %s' % (
+                    table, column, decl) if decl else \
+                    'ALTER TABLE "%s" ADD COLUMN "%s"' % (table, column)
+            conn.execute(ddl)
+        schema = self._schema(conn)
+        defaults = self._defaults(conn)
+        schema.setdefault(table, {})[column] = ctype
+        if event["has_default"]:
+            defaults.setdefault(table, {})[column] = event["default"]
+        self._set_meta(conn, "schema_json", json.dumps(schema, sort_keys=True))
+        self._set_meta(conn, "schema_defaults_json",
+                       json.dumps(defaults, sort_keys=True))
+        self._set_meta(conn, "tables_json", json.dumps(sorted(schema)))
 
     @staticmethod
     def _convert(value, ctype):
@@ -157,6 +224,7 @@ class Replica:
         self._set_meta(conn, "state", _RECEIVING)
         self._set_meta(conn, "tables_json", "{}")
         self._set_meta(conn, "schema_json", "{}")
+        self._set_meta(conn, "schema_defaults_json", "{}")
         self._set_meta(conn, "position", "0")
 
     class _Tx:
@@ -241,20 +309,34 @@ class Replica:
                                 (batch["batch_id"],)).fetchone()
             applied = False
             if seen is None:
-                schema = {spec["table"]: spec["columns"] for spec in batch["tables"]}
-                if state == _RECEIVING:
+                batch_schema = {spec["table"]: spec["columns"]
+                                for spec in batch["tables"]}
+                batch_defaults = batch.get("schema_defaults", {})
+                is_schema_batch = batch.get("kind") == "schema_change"
+                if state == _RECEIVING and not is_schema_batch:
                     # The full load defines the data tables, including empty
                     # subscribed tables (they still exist, with the frozen
-                    # column types).
-                    self._ensure_data_tables(conn, batch["tables"], schema,
-                                             reset=False)
-                    self._set_meta(conn, "tables_json", json.dumps(sorted(schema)))
+                    # column types and declared defaults).
+                    self._ensure_data_tables(conn, batch["tables"], batch_schema,
+                                             batch_defaults, reset=False)
+                    self._set_meta(conn, "tables_json",
+                                   json.dumps(sorted(batch_schema)))
                     self._set_meta(conn, "schema_json",
-                                   json.dumps(schema, sort_keys=True))
-                if batch["phase"] == "full":
+                                   json.dumps(batch_schema, sort_keys=True))
+                    self._set_meta(conn, "schema_defaults_json",
+                                   json.dumps(batch_defaults, sort_keys=True))
+                if is_schema_batch:
+                    # Structural switch: column type, default, current position
+                    # and the applied-batch record all land in this one local
+                    # commit.  A redelivery after a crash finds the batch id and
+                    # never re-applies; the ALTER itself is idempotent.
+                    for event in batch["items"]:
+                        self._apply_schema_change(conn, event)
+                elif batch["phase"] == "full":
                     for item in batch["items"]:
                         if item["present"]:
-                            self._apply_row(conn, item["table"], schema[item["table"]],
+                            self._apply_row(conn, item["table"],
+                                            batch_schema[item["table"]],
                                             item["row_id"], item["version"],
                                             item["values"])
                         else:  # pragma: no cover - full pages contain only present rows
@@ -262,10 +344,14 @@ class Replica:
                     if batch["full_complete"]:
                         self._set_meta(conn, "state", _READY)
                 else:
+                    # Row-change batches use the replica's *current* local
+                    # schema, which already includes every prior schema switch.
+                    local_schema = self._schema(conn)
                     for item in batch["items"]:
                         after = item["after"]
                         if after["present"]:
-                            self._apply_row(conn, item["table"], schema[item["table"]],
+                            self._apply_row(conn, item["table"],
+                                            local_schema[item["table"]],
                                             item["row_id"], after["version"],
                                             after["values"])
                         else:
@@ -282,6 +368,8 @@ class Replica:
         self._last_batch = {
             "batch_id": batch["batch_id"],
             "phase": batch["phase"],
+            "kind": batch.get("kind", "full" if batch["phase"] == "full"
+                              else "row_change"),
             "generation": batch["generation"],
             "position": batch["position"],
             "full_complete": bool(batch["full_complete"]),
@@ -373,6 +461,8 @@ class Replica:
                 "generation": self._meta(conn, "generation"),
                 "position": int(self._meta(conn, "position", "0")),
                 "tables": json.loads(self._meta(conn, "tables_json", "{}")),
+                "schema_defaults": json.loads(
+                    self._meta(conn, "schema_defaults_json", "{}")),
                 "applied_batches": conn.execute(
                     "SELECT COUNT(*) FROM replica_applied").fetchone()[0],
             }

@@ -18,10 +18,10 @@ See ``docs/DESIGN.md`` for the isolation and conflict rules.
 
 from .engine import Client, Transaction, TransactionHandle, new_txid
 from .errors import (ConflictError, ManagedTxError, PredicateError, SchemaError,
-                     TransactionError, TransactionNotFound, BusyError,
-                     SubscriptionError, SubscriptionNotFound, SubscriptionClosed,
-                     StaleSubscriptionGeneration, ReplicaError, ReplicaNotReady,
-                     ReplicaGenerationError)
+                     SchemaConflictError, TransactionError, TransactionNotFound,
+                     BusyError, SubscriptionError, SubscriptionNotFound,
+                     SubscriptionClosed, StaleSubscriptionGeneration, ReplicaError,
+                     ReplicaNotReady, ReplicaGenerationError)
 from .subscription import Subscription, SubscriptionHandle
 from .replica import Replica
 from .values import (And, Atom, FALSE, LiteralFalse, LiteralTrue, Not, Or, TRUE,
