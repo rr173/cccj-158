@@ -61,6 +61,7 @@ import secrets
 import time
 
 from . import canonical
+from . import references as refs_mod
 from . import subscription as subscription_mod
 from .errors import (ConflictError, SchemaConflictError, SchemaError,
                      TransactionError, TransactionNotFound)
@@ -297,6 +298,32 @@ class Client:
                             "columns": json.loads(r["columns_json"])})
             return out
         return self.store.run_tx(_q, readonly=True)
+
+    # -- managed reference constraints --------------------------------------
+
+    def register_reference(self, name, parent_table, child_table, child_column,
+                           on_delete):
+        """Declare a durable managed reference constraint.
+
+        ``child_table.child_column`` (a ``text`` column) references
+        ``parent_table.row_id``; ``on_delete`` is ``"restrict"`` or
+        ``"cascade"``.  Business ``None`` is "no reference".  Registration
+        scans the already-committed data and is refused (with no half
+        definition) on an existing orphan, a duplicate name or column binding,
+        an unknown table/column, or a non-text column.  The rule is durable and
+        applies to every later commit, including write transactions already in
+        flight when the registration lands.
+        """
+        return refs_mod.register(self, name, parent_table, child_table,
+                                 child_column, on_delete)
+
+    def list_references(self):
+        """Every durable reference constraint, ordered by its unique name."""
+        return refs_mod.list_registered(self)
+
+    def get_reference(self, name):
+        """One durable constraint record, or ``None`` when the name is unknown."""
+        return refs_mod.get_constraint(self, name)
 
     # -- begin ---------------------------------------------------------------
 
@@ -701,10 +728,18 @@ class Client:
         prior = conn.execute("SELECT decision, commit_version, evidence_json FROM decisions "
                              "WHERE user_txid=?", (handle.txid,)).fetchone()
         if prior is not None:
-            return {"txid": handle.txid, "status": prior["decision"],
-                    "commit_version": prior["commit_version"], "replayed": True,
-                    "evidence": json.loads(prior["evidence_json"])
-                    if prior["evidence_json"] else None}
+            prior_evidence = json.loads(prior["evidence_json"]) \
+                if prior["evidence_json"] else None
+            outcome = {"txid": handle.txid, "status": prior["decision"],
+                       "commit_version": prior["commit_version"], "replayed": True,
+                       "evidence": prior_evidence}
+            if prior["decision"] == COMMITTED and prior_evidence is not None:
+                # Reconstruct the same public result shape, including the
+                # implicit deletes, so a re-sent commit cannot delete or advance
+                # anything again but returns the identical durable decision.
+                outcome["writes"] = prior_evidence.get("writes", [])
+                outcome["cascade_deletes"] = prior_evidence.get("cascade_deletes", [])
+            return outcome
         if tx["state"] != ACTIVE:
             raise TransactionError("transaction %s is %s and has no decision"
                                    % (handle.txid, tx["state"]))
@@ -717,14 +752,32 @@ class Client:
         # Defensive structural guard: staging normally refuses a migrated table
         # already, but check again inside this atomic transaction so a migration
         # landing after the last stage still cannot produce a malformed write.
-        for table in [r[0] for r in conn.execute(
-                "SELECT DISTINCT table_name FROM staged WHERE user_txid=? ORDER BY table_name",
-                (handle.txid,))]:
+        staged_tables = [r[0] for r in conn.execute(
+            "SELECT DISTINCT table_name FROM staged WHERE user_txid=? ORDER BY table_name",
+            (handle.txid,))]
+        for table in staged_tables:
             snap_types, _d = self.store.schema_at_conn(conn, table, base_version)
             live_types, _ld, _c = self.store.latest_schema_conn(conn, table)
             if set(snap_types) != set(live_types):
                 self._raise_schema_conflict(conn, handle, table, base_version,
                                             snap_types, live_types)
+
+        # Managed reference constraints are evaluated against the complete
+        # state this commit would produce (not the staged operation order),
+        # inside this same atomic transaction.  A returned problem rejects the
+        # whole commit -- including every otherwise-valid staged write -- and
+        # the returned cascade set becomes a set of real, implicit deletes
+        # written together with the explicit writes below.  A read-only
+        # transaction changes no business state, so it cannot affect or
+        # violate a reference and skips the planner.
+        if staged_tables:
+            ref_problems, cascade = refs_mod.plan_commit(
+                conn, self, handle.txid, base_version, staged_tables)
+        else:
+            ref_problems, cascade = [], []
+        if ref_problems:
+            return self._record_rejection(conn, handle, base_version, ref_problems)
+        cascade_keys = {(item["table"], item["row_id"]) for item in cascade}
 
         commit_version = Store.bump_commit_version(conn)
         writes = []
@@ -733,15 +786,24 @@ class Client:
         # rows for exactly these tables are appended in this same atomic
         # commit, so an aborted/uncommitted staging can never enter the log.
         watched = subscription_mod.watched_tables(conn)
-        tables = [r[0] for r in conn.execute(
-            "SELECT DISTINCT table_name FROM staged WHERE user_txid=? ORDER BY table_name",
-            (handle.txid,))]
+        tables = staged_tables
+        # Cascade may reach tables the transaction never explicitly staged.
+        for item in cascade:
+            if item["table"] not in tables:
+                tables.append(item["table"])
         for table in tables:
             # The guard above already proved this table did not change after
             # the transaction's start view, so its snapshot column set is the
             # one its staged values conform to.
             columns_map, _d = self.store.schema_at_conn(conn, table, base_version)
             for rid, eff in self._staged_for_table(conn, handle.txid, table):
+                if (table, rid) in cascade_keys:
+                    # A row this transaction itself inserted and the cascade
+                    # then removes never reaches committed state: suppress the
+                    # staged insert completely (no history row, no write
+                    # evidence, no change event).  Its removal is reported once
+                    # in cascade_deletes with ephemeral=True.
+                    continue
                 ordinal += 1
                 new_values = eff["new_values"]
                 deleted = 1 if eff["op"] == "delete" else 0
@@ -789,8 +851,58 @@ class Client:
                                "old_values": eff["old_values"],
                                "new_values": new_values,
                                "commit_version": commit_version})
-        evidence = {"writes": writes, "base_version": base_version,
-                    "commit_version": commit_version}
+
+        # Implicit cascade deletes are real writes in the *same* source
+        # commit: one appended tombstone version, one committed_writes evidence
+        # row, and one subscription change (for a watched table) per deleted
+        # identity.  An identity this transaction inserted and the cascade then
+        # removes ("ephemeral") never existed in the committed state, so it gets
+        # no fabricated history row and no change event.
+        for item in cascade:
+            table, rid = item["table"], item["row_id"]
+            if item["ephemeral"]:
+                continue
+            ordinal += 1
+            # A cascade can reach a table the transaction never explicitly
+            # staged.  Its tombstone only names the managed identity columns,
+            # so resolving the current (live) column set is always valid and
+            # keeps this path independent of the transaction's start-view
+            # schema for tables it never wrote.
+            columns_map, _d = self.store.schema_at_conn(
+                conn, table, Store.current_commit_version(conn))
+            placeholders = ["row_id", "version", "deleted"] + list(columns_map)
+            values = [rid, commit_version, 1] + [None for _ in columns_map]
+            conn.execute(
+                'INSERT INTO "%s" (%s) VALUES (%s)'
+                % (hist_table(table),
+                   ", ".join('"%s"' % c for c in placeholders),
+                   ", ".join("?" for _ in placeholders)), values)
+            conn.execute(
+                "INSERT INTO committed_writes(ordinal, user_txid, table_name, row_id, op, "
+                "old_values, new_values, old_version, new_version, commit_version) "
+                "VALUES (?, ?, ?, ?, 'cascade_delete', ?, NULL, ?, ?, ?)",
+                (ordinal, handle.txid, table, rid,
+                 canonical.values_to_json(item["old_values"]),
+                 item["old_version"], commit_version, commit_version))
+            if table in watched:
+                conn.execute(
+                    "INSERT INTO sub_changes(commit_version, user_txid, "
+                    "table_name, row_id, old_present, old_values, old_version, "
+                    "new_present, new_values, new_version) "
+                    "VALUES (?, ?, ?, ?, 1, ?, ?, 0, NULL, NULL)",
+                    (commit_version, handle.txid, table, rid,
+                     canonical.values_to_json(item["old_values"]),
+                     item["old_version"]))
+        cascade_report = [
+            {"table": item["table"], "row_id": item["row_id"],
+             "op": "cascade_delete", "constraint": item["constraint"],
+             "parent_table": item["parent_table"], "parent_id": item["parent_id"],
+             "depth": item["depth"], "ephemeral": item["ephemeral"],
+             "old_version": item["old_version"], "commit_version": commit_version,
+             "propagation_source": [item["parent_table"], item["parent_id"]]}
+            for item in cascade]
+        evidence = {"writes": writes, "cascade_deletes": cascade_report,
+                    "base_version": base_version, "commit_version": commit_version}
         conn.execute("INSERT INTO decisions(user_txid, decision, commit_version, decided_wall, "
                      "evidence_json) VALUES (?, 'committed', ?, ?, ?)",
                      (handle.txid, commit_version, time.time(),
@@ -800,7 +912,8 @@ class Client:
         conn.execute("DELETE FROM staged WHERE user_txid=?", (handle.txid,))
         conn.execute("DELETE FROM gc_leases WHERE user_txid=?", (handle.txid,))
         return {"txid": handle.txid, "status": COMMITTED,
-                "commit_version": commit_version, "writes": writes, "replayed": False}
+                "commit_version": commit_version, "writes": writes,
+                "cascade_deletes": cascade_report, "replayed": False}
 
     def _record_rejection(self, conn, handle, base_version, problems):
         # Audit evidence covers every transaction with recorded reads or

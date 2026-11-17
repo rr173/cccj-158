@@ -107,3 +107,15 @@ class SchemaConflictError(ManagedTxError):
     def as_dict(self):
         return {"error": self.code, "message": str(self), "evidence": self.evidence}
 
+
+class ReferenceError(SchemaError):
+    """A reference-constraint registration was malformed or unsupported.
+
+    Raised for a duplicate constraint name, an unknown table or column, a
+    non-text referencing column, an unsupported delete strategy, or an attempt
+    to register a rule that existing committed data already violates.  The
+    registration transaction is rolled back, so no half definition remains.
+    Commit-time violations of an already-registered rule are not raised here:
+    they are :class:`ConflictError` rejections carrying reference evidence.
+    """
+

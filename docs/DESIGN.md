@@ -16,6 +16,8 @@ tx_ops(txid, ord, kind, table, detail_json)      ordered read/write record
 committed_writes(ordinal, txid, table, row_id, op, old/new values,
                  old/new version, commit_version)
 gc_leases(txid, expires_wall)
+reference_constraints(constraint_name, parent_table, child_table,
+                      child_column, on_delete, registered_version, created_wall)
 <relation>_rows(row_id, version, deleted, <declared columns>)  history
 ```
 
@@ -285,4 +287,117 @@ retention boundary — the minimum acknowledged position of open subscriptions �
 so a slow full load, a pending old batch and an in-flight old transaction keep
 exactly the structural and row versions they still need, and explicit cleanup
 reclaims the rest and reports the boundary.
+
+## 8. Managed reference constraints
+
+### Durable catalog and registration atomicity
+
+`reference_constraints` is an ordinary durable catalog table (schema v4): one
+row per unique constraint name recording the parent table, the child table and
+the single `text` child column, and the `restrict`/`cascade` strategy.  The
+SQLite native foreign-key switch is deliberately irrelevant: the product
+manages logical, append-only, versioned history, so validity is defined over
+live logical rows rather than physical row existence.
+
+`register_reference` validates the declaration shape before opening any write
+transaction, then runs one `BEGIN IMMEDIATE` transaction that (1) re-checks the
+unique name and the one-constraint-per-column rule against the durable rows,
+(2) scans the newest committed live images of the child table and rejects the
+registration if any non-null value has no live parent, and (3) inserts the
+catalog row.  Because the scan and the insert share one write-locked
+transaction, a concurrent committer cannot land an orphan in the gap, and any
+failure rolls back the whole short transaction — there is never a half
+definition.  Registration does not itself consume a `commit_version`
+position; it records the position current at registration time for
+informational purposes.
+
+### Why in-flight transactions cannot escape a new rule
+
+Consider transaction `T` that began before a registration and commits after it.
+`T`'s reference check does not run at `begin` or while staging; it runs inside
+`T`'s own commit transaction, where the durable `reference_constraints` rows
+are read anew.  Two cases cover every interleaving:
+
+1. `T` commits before the registration transaction takes the write lock: the
+   catalog row is not yet visible, so `T` is correctly checked against the
+   rules that existed in real time before its serialization point.
+2. The registration commits first: when `T` later enters its atomic commit it
+   reads the new catalog row and plans against the current committed state, so
+   an orphan staged before registration is rejected at commit.  A read-only
+   `T` has no write set and serializes at its start view, so it never
+   revalidates and its historical reads are untouched.
+
+This is the same lock-and-recheck structure that makes schema migrations and
+subscriptions safe; no background build task or table lock is needed.
+
+### Final-state planning inside the commit transaction
+
+`references.plan_commit` is invoked after the ordinary OCC validation and
+structural guard, inside the same short SQLite transaction.  It materializes
+the *final* business state: for every table reachable through a constraint,
+the newest committed live images (at the current version, so concurrent
+commits are visible) overlaid with the committing transaction's folded staged
+changes.  All subsequent decisions are pure functions of that state and the
+durable catalog, which makes a re-sent commit reconstruct the identical
+decision and cascade set.
+
+1. *Roots.* An identity is a root when its folded staged op is a delete and it
+   is absent from the final view.  A delete followed by a same-id re-insert is
+   not a root (the parent exists at the end); an insert-then-delete of a brand
+   new identity *is* a root, because the rule is evaluated on the final state.
+2. *Cascade fixpoint.* Starting from the roots, each `cascade` edge adds the
+   currently pointing children of every deleted identity to a worklist,
+   guarded by a visited set.  The visited set is exactly the de-duplication
+   argument for self loops, multi-table rings and diamonds: an identity is
+   expanded at most once, so the traversal always terminates and each identity
+   is deleted once.  The record kept for an identity names the first path that
+   reached it, i.e. its auditable propagation source and depth.
+3. *Evidence and ephemeral rows.* Each implicit delete captures the true
+   committed prior image and version for history.  When the committing
+   transaction itself inserted that child and the cascade removes it
+   (`base_present` false), the row never existed in committed state: the
+   engine suppresses its staged insert entirely and emits no tombstone or
+   change event, reporting it once with `ephemeral: true`.
+4. *Restrict after the fixpoint.* A `restrict` edge fires only when a
+   *surviving* child (not in the cascade set, not explicitly deleted) still
+   points at a deleted identity.  Evaluating it after step 2 means a referrer
+   removed in the same batch cannot block the commit, while a genuine surviving
+   referrer always rejects it — `restrict` is never executed as `cascade`.
+5. *Generic validity.* Finally every surviving non-null reference in the final
+   state must resolve to a live parent; this rejects outright orphans (a parent
+   that never existed) independently of the strategy.  Every failure produces
+   evidence naming the constraint, the child identity and the missing parent,
+   and the engine's ordinary all-or-nothing rejection rolls back every staged
+   write.
+
+### Cascade deletes are first-class writes
+
+An implicit delete participates in every mechanism that protects an explicit
+one, all within the committing transaction rather than a follow-up
+transaction:
+
+* **Version precondition (ww).** The planner queries `committed_writes` for any
+  change to a cascade-target identity committed after the transaction's
+  snapshot and records a `cascade_conflict`.  A reference row inserted or
+  re-parented by a concurrent transaction therefore cannot be silently removed;
+  the later committer loses with evidence, while two disjoint parent/child
+  groups have no intersecting identities and both commit.
+* **History and evidence.** A non-ephemeral implicit delete appends one
+  tombstone history row and one `committed_writes` row with the distinct
+  `cascade_delete` op, preserving the real before/after versions, all stamped
+  with the commit's single `commit_version`.
+* **Subscriptions.** Watched tables receive one `sub_changes` row per implicit
+  delete in the same atomic commit, so a subscriber sees the explicit and
+  implicit net changes as one per-commit batch; the replica only applies the
+  delivered images and never runs reference logic.
+* **Idempotence and recovery.** The full decision, including
+  `cascade_deletes`, is stored in `decisions.evidence_json`.  A resend returns
+  that durable record without writing, deleting or advancing the position
+  again; a crash before the decision leaves only invisible staging, which
+  `recover()` resolves exactly as before.
+
+Reads deliberately do not predict cascades: pre-commit `read` keeps the
+"start view plus own staged operations" semantics, because a transaction is
+entitled to reason about the state it staged, and only the atomic commit
+decides the final reference-valid state and its propagation.
 

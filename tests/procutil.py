@@ -91,6 +91,18 @@ class Worker:
         return self.send({"cmd": "add_column", "table": table,
                           "column": column, "type": ctype, "default": default})
 
+    def register_reference(self, name, parent_table, child_table, child_column,
+                           on_delete):
+        return self.send({"cmd": "register_reference", "constraint": name,
+                          "parent_table": parent_table, "child_table": child_table,
+                          "child_column": child_column, "on_delete": on_delete})
+
+    def list_references(self):
+        return self.send({"cmd": "list_references"})["result"]
+
+    def get_reference(self, name):
+        return self.send({"cmd": "get_reference", "constraint": name})["result"]
+
     def schema_history(self, table=None):
         return self.send({"cmd": "schema_history", "table": table})["result"]
 

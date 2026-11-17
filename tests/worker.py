@@ -96,6 +96,15 @@ def handle_command(client, handles, cmd):
         return {"ok": True,
                 "result": client.add_column(cmd["table"], cmd["column"],
                                             cmd["type"], cmd["default"])}
+    if name == "register_reference":
+        return {"ok": True,
+                "result": client.register_reference(
+                    cmd["constraint"], cmd["parent_table"], cmd["child_table"],
+                    cmd["child_column"], cmd["on_delete"])}
+    if name == "list_references":
+        return {"ok": True, "result": client.list_references()}
+    if name == "get_reference":
+        return {"ok": True, "result": client.get_reference(cmd["constraint"])}
     if name == "schema_history":
         return {"ok": True, "result": client.schema_history(cmd.get("table"))}
     if name == "pull":

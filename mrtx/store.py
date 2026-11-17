@@ -24,7 +24,7 @@ import time
 from .errors import BusyError, InternalInvariantError, SchemaError
 from .values import COLUMN_TYPES, check_value, TYPE_BOOL, TYPE_INT, TYPE_TEXT, TYPE_NULL
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 
@@ -233,6 +233,28 @@ BASE_DDL = [
     """,
     "CREATE INDEX IF NOT EXISTS schema_changes_by_version ON schema_changes(commit_version, id)",
     "CREATE INDEX IF NOT EXISTS schema_changes_by_table ON schema_changes(table_name, commit_version)",
+    # -- managed reference constraints ---------------------------------------
+    # A durable declaration: a text column of a child table references the
+    # implicit row_id of a (possibly identical) parent table.  Only the
+    # ``restrict`` and ``cascade`` delete strategies exist.  Rows are written
+    # only by a fully validated registration transaction, so a constraint row
+    # is authoritative the instant it becomes visible; there is no half
+    # definition.  ``registered_version`` records the source position current at
+    # registration time (informational; registration itself does not consume a
+    # position), which pins which concurrent commits the new rule must cover.
+    """
+    CREATE TABLE IF NOT EXISTS reference_constraints (
+        constraint_name TEXT PRIMARY KEY,
+        parent_table TEXT NOT NULL,
+        child_table TEXT NOT NULL,
+        child_column TEXT NOT NULL,
+        on_delete TEXT NOT NULL CHECK (on_delete IN ('restrict', 'cascade')),
+        registered_version INTEGER NOT NULL,
+        created_wall REAL NOT NULL,
+        UNIQUE (child_table, child_column, constraint_name))
+    """,
+    "CREATE INDEX IF NOT EXISTS ref_by_parent ON reference_constraints(parent_table)",
+    "CREATE INDEX IF NOT EXISTS ref_by_child ON reference_constraints(child_table)",
 ]
 
 
@@ -361,40 +383,44 @@ class Store:
                              (str(SCHEMA_VERSION),))
                 conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('seq', '0')")
                 conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('commit_version', '0')")
-            elif int(row[0]) in (1, 2):
+            elif int(row[0]) in (1, 2, 3):
                 # v1 -> v2 added the subscription tables; v2 -> v3 adds the
                 # versioned column catalog and the schema-change log.  New
                 # tables are created above with IF NOT EXISTS, but an existing
                 # subscriptions table still needs the defaults column added.
-                sub_cols = {r[1] for r in conn.execute(
-                    "PRAGMA table_info(subscriptions)")}
-                if "schema_defaults_json" not in sub_cols:
-                    conn.execute(
-                        "ALTER TABLE subscriptions ADD COLUMN "
-                        "schema_defaults_json TEXT NOT NULL DEFAULT '{}'")
-                # Backfill one immutable schema row per existing table from the
-                # current catalog, so older repositories keep their history
-                # without a rewrite.
-                existing = {r[0] for r in conn.execute(
-                    "SELECT table_name FROM table_schemas")}
-                for tname, in conn.execute(
-                        "SELECT table_name FROM tables ORDER BY table_name"):
-                    if tname in existing:
-                        continue
-                    cols = [{"name": r[0], "type": r[1], "has_default": False}
-                            for r in conn.execute(
-                                "SELECT column_name, column_type FROM table_columns "
-                                "WHERE table_name=? ORDER BY position", (tname,))]
-                    # The legacy table carried these columns for its entire
-                    # history, so schema version 1 is visible at every snapshot
-                    # (effective position 0), including in-flight transactions
-                    # whose base_version predates this upgrade.
-                    conn.execute(
-                        "INSERT INTO table_schemas(table_name, schema_version, "
-                        "effective_version, columns_json) VALUES (?, 1, 0, ?)",
-                        (tname, json.dumps(cols, sort_keys=True)))
-                    conn.execute("UPDATE tables SET version=1 WHERE table_name=?",
-                                 (tname,))
+                if int(row[0]) in (1, 2):
+                    sub_cols = {r[1] for r in conn.execute(
+                        "PRAGMA table_info(subscriptions)")}
+                    if "schema_defaults_json" not in sub_cols:
+                        conn.execute(
+                            "ALTER TABLE subscriptions ADD COLUMN "
+                            "schema_defaults_json TEXT NOT NULL DEFAULT '{}'")
+                    # Backfill one immutable schema row per existing table from the
+                    # current catalog, so older repositories keep their history
+                    # without a rewrite.
+                    existing = {r[0] for r in conn.execute(
+                        "SELECT table_name FROM table_schemas")}
+                    for tname, in conn.execute(
+                            "SELECT table_name FROM tables ORDER BY table_name"):
+                        if tname in existing:
+                            continue
+                        cols = [{"name": r[0], "type": r[1], "has_default": False}
+                                for r in conn.execute(
+                                    "SELECT column_name, column_type FROM table_columns "
+                                    "WHERE table_name=? ORDER BY position", (tname,))]
+                        # The legacy table carried these columns for its entire
+                        # history, so schema version 1 is visible at every snapshot
+                        # (effective position 0), including in-flight transactions
+                        # whose base_version predates this upgrade.
+                        conn.execute(
+                            "INSERT INTO table_schemas(table_name, schema_version, "
+                            "effective_version, columns_json) VALUES (?, 1, 0, ?)",
+                            (tname, json.dumps(cols, sort_keys=True)))
+                        conn.execute("UPDATE tables SET version=1 WHERE table_name=?",
+                                     (tname,))
+                # v3 -> v4 adds the managed reference-constraint catalog.  The
+                # table is created above with IF NOT EXISTS; an existing
+                # repository simply starts with zero declared constraints.
                 conn.execute("UPDATE meta SET value=? WHERE key='schema_version'",
                              (str(SCHEMA_VERSION),))
             elif int(row[0]) != SCHEMA_VERSION:

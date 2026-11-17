@@ -22,7 +22,7 @@ library.
 # from the directory containing the mrtx/ package
 python3 -c "import mrtx; print(mrtx.Client)"
 
-# full test suite (stdlib unittest, 140 tests)
+# full test suite (stdlib unittest, 184 tests)
 cd tests && python3 -m unittest discover -s . -p 'test_*.py'
 
 # the runnable end-to-end drills
@@ -31,6 +31,8 @@ python3 -m mrtx.drill --db /tmp/keep.db     # keep the database
 python3 -m mrtx.sync_drill                  # subscriptions + SQLite replica
 python3 -m mrtx.sync_drill --keep /tmp/sync # keep both databases
 python3 -m mrtx.online_add_column_drill     # online add-column migration
+python3 -m mrtx.reference_drill             # reference constraints + cascades
+python3 -m mrtx.reference_drill --keep /tmp/ref
 ```
 
 Each drill exits 0 only if every expectation holds; it prints the actual read
@@ -164,10 +166,11 @@ with `c.dependency_graph()`.
 
 | exception              | meaning                                                    |
 |------------------------|------------------------------------------------------------|
-| `ConflictError`        | serializability/precondition refusal, with `.code` and `.evidence` |
+| `ConflictError`        | serializability/precondition/reference refusal, with `.code` and `.evidence` (codes include `write_conflict`, `read_conflict`, `reference_violation`, `restrict_violation`, `cascade_conflict`) |
 | `TransactionError`     | invalid operation for the transaction's state (closed, identity already visible, …) |
 | `TransactionNotFound`  | unknown transaction id                                     |
 | `SchemaError`          | unknown table/column, wrong type, malformed schema         |
+| `ReferenceError`       | malformed/unsupported reference registration or an existing orphan; a `SchemaError` subclass, so existing schema-error handling still catches it |
 | `PredicateError`       | malformed or ill-typed predicate                           |
 | `BusyError`            | internal SQLite lock contention after bounded retries — **never a conflict** |
 
@@ -439,7 +442,120 @@ crash/replay seam) is in `python3 -m mrtx.online_add_column_drill`.
 
 ---
 
-## 9. Repository layout
+## 9. Managed reference constraints and commit-time cascades
+
+A **reference constraint** declares that one `text` column of a child table
+references the implicit `row_id` of a parent table.  The two tables may be the
+same (self reference), several tables may form a ring, and one row may point at
+several parents through different columns.  A business `null` means "no
+reference"; every other string must match exactly one **live** parent row,
+compared by Unicode code point with no normalization and case folding.  Two
+delete strategies exist: `restrict` and `cascade`.  The feature does not use
+SQLite's native foreign-key switch — the repository manages logical,
+append-only, versioned history itself.
+
+### Registration and querying
+
+```python
+c.register_reference(
+    "entry_account",            # unique constraint name
+    parent_table="accounts",
+    child_table="entries",
+    child_column="acct_id",     # must be a declared text column
+    on_delete="cascade")        # "restrict" | "cascade"
+
+c.list_references()             # every durable declaration, ordered by name
+c.get_reference("entry_account")
+```
+
+Registration is one atomic short write transaction.  It is explicitly refused,
+leaving **no half definition**, when:
+
+* the name is already used, or the same child column already carries a
+  constraint (one managed reference per column);
+* a named table or column does not exist, or the column is not `text`;
+* `on_delete` is neither `restrict` nor `cascade`;
+* the already-committed data contains an orphan (a non-null value with no live
+  parent).  The error names the first offending child row and missing parent.
+
+The declaration is durable: it survives process restart and governs every
+later commit.  A write transaction that began **before** registration and
+commits **after** it is still validated by the new rule; a read-only
+transaction that began earlier keeps its historical start view and completes
+unchanged.  Constraint deletion, arbitrary SQL, other key types and
+background-built constraints are intentionally not supported.
+
+### Deferred, final-state checking
+
+Reference validation runs at `commit`, never while staging.  One transaction
+may therefore insert the child before the parent, hold a transient orphan and
+repair it, or delete a parent and insert it back under the same `row_id` —
+none of these intermediate states can reject a staging call.  The decision is
+made against the **complete business state the commit would produce**.  If the
+final state still contains an invalid reference, the whole transaction fails:
+the refusal evidence (`ConflictError`, code `reference_violation`) names the
+constraint, the child identity and the missing parent, and every otherwise
+valid write staged in that transaction is rolled back.  Re-sending the commit
+returns the same durable decision.
+
+### Cascade and restrict at commit time
+
+When a parent identity is explicitly deleted and does not reappear in the
+final state:
+
+* every `cascade` edge deletes the still-pointing child rows, then propagates
+  from those identities transitively.  The delete set is a fixpoint computed
+  with a worklist and a visited set, so an identity reached through a self
+  loop, a multi-table ring or a diamond is deleted **exactly once**, and every
+  implicit delete carries its auditable propagation source
+  (`constraint`, `parent_table`, `parent_id`, `depth`);
+* a parent deleted and re-inserted with the same `row_id` is not a cascade
+  root, and a child re-pointed at another live parent inside the transaction
+  is not deleted because of its old reference;
+* `restrict` is evaluated **after** the full cascade set is known.  A
+  surviving row that still references a deleted identity rejects the commit
+  (`restrict_violation`), but a referrer that is itself deleted — explicitly or
+  by the cascade — never blocks it.  A `restrict` edge is never silently
+  executed as a cascade.
+
+Implicit cascade deletes are real writes inside the **same** atomic commit as
+the user's explicit writes: one shared source position, one appended
+tombstone version, one `committed_writes` evidence row and one subscription
+change per identity.  They obey the ordinary version precondition: a child row
+inserted or changed by another transaction after this snapshot cannot be
+silently removed — the later committer is rejected with
+`cascade_conflict` evidence naming the concurrent writer.  A row that this
+same transaction inserted and the cascade then removes never existed in the
+committed state, so it leaves no fabricated history row or change event (it is
+reported once with `ephemeral: true`).
+
+### What the commit result and subscriptions show
+
+```python
+result = tx.commit()
+# result["writes"]          explicit user writes, op insert|update|delete
+# result["cascade_deletes"] implicit deletes, op "cascade_delete", each with
+#                            constraint, propagation_source, depth, ephemeral
+# every entry in both lists shares result["commit_version"]
+```
+
+Reads before the commit keep the existing "start view plus own staged
+operations" behavior; they never predict cascade results.  A subscription that
+covers an affected table receives the whole net change — explicit and implicit
+deletes together — as **one** incremental batch at one source position, even
+when it exceeds the pull budget.  The replica applies it in one local
+transaction and never re-derives references or cascades itself.  A committed
+decision is durable before the response: reopening and re-sending the commit,
+or re-delivering an unacknowledged replica batch, neither deletes twice nor
+advances the source position again.
+
+A runnable demonstration of every rule (hand-computed delete sets, barrier
+races in real processes, the replica mirror and both replay seams) is in
+`python3 -m mrtx.reference_drill`.
+
+---
+
+## 10. Repository layout
 
 ```
 mrtx/
@@ -449,30 +565,34 @@ mrtx/
   store.py        SQLite schema, short transactions, bounded retry, recovery,
                   versioned column catalog and online add_column
   engine.py       snapshots, staging, OCC validation, commit/abort, GC
+  references.py   durable reference catalog, deferred checks, cascade planner
   subscription.py durable full-then-incremental cursor, schema-change stream
   replica.py      separate-SQLite replica with idempotent local apply
   errors.py       exception types
   drill.py        runnable transaction-level demonstration
   sync_drill.py   runnable subscription + replica demonstration
   online_add_column_drill.py  runnable online-migration demonstration
+  reference_drill.py          runnable reference-constraint demonstration
 tests/
   support.py      temp-repo fixtures and drain helpers
   procutil.py     real OS-process harness (JSON-line pipes)
   worker.py       child process command loop (transactions and subscriptions)
   serialcheck.py  independent serializability checker (not used by mrtx)
-  test_*.py       unit, concurrency, process, subscription, replica, migration tests
+  test_*.py       unit, concurrency, process, subscription, replica, migration,
+                  reference-constraint tests
 docs/
   DESIGN.md       design notes, serializability argument, sync retention notes
 ```
 
 ---
 
-## 10. API quick reference
+## 11. API quick reference
 
 ```python
 from mrtx import Client, eq, lt, le, is_null, and_, or_, not_, TRUE, FALSE
 from mrtx import (ConflictError, TransactionError, SchemaError,
-                  SchemaConflictError, PredicateError, BusyError)
+                  SchemaConflictError, ReferenceError, PredicateError,
+                  BusyError)
 
 c = Client(db_path)                      # opens/creates schema, recovers orphans
 c.create_table(name, [(col, type), ...]) # int64 | text | bool | null
@@ -482,6 +602,13 @@ c.add_column(table, column, ctype, default)
                                          # {schema_version, commit_version, ...}
 c.table_schemas(table)                   # immutable schema versions + positions
 c.schema_history(table=None)             # ordered add_column events
+
+# --- managed reference constraints ----------------------------------------
+c.register_reference(name, parent_table, child_table, child_column, on_delete)
+                                         # on_delete: "restrict" | "cascade";
+                                         # validates existing data, then persists
+c.list_references()                      # durable declarations, ordered by name
+c.get_reference(name)                    # one declaration, or None
 
 tx = c.begin(txid=None)                  # fixes the start view; returns Transaction
 rows = tx.read(table, columns=None, where=None)

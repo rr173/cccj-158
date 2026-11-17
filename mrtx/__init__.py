@@ -21,7 +21,7 @@ from .errors import (ConflictError, ManagedTxError, PredicateError, SchemaError,
                      SchemaConflictError, TransactionError, TransactionNotFound,
                      BusyError, SubscriptionError, SubscriptionNotFound,
                      SubscriptionClosed, StaleSubscriptionGeneration, ReplicaError,
-                     ReplicaNotReady, ReplicaGenerationError)
+                     ReplicaNotReady, ReplicaGenerationError, ReferenceError)
 from .subscription import Subscription, SubscriptionHandle
 from .replica import Replica
 from .values import (And, Atom, FALSE, LiteralFalse, LiteralTrue, Not, Or, TRUE,
@@ -31,6 +31,7 @@ __all__ = [
     "Client", "Transaction", "TransactionHandle", "new_txid",
     "ConflictError", "ManagedTxError", "PredicateError", "SchemaError",
     "TransactionError", "TransactionNotFound", "BusyError",
+    "ReferenceError",
     "Subscription", "SubscriptionHandle", "SubscriptionError",
     "SubscriptionNotFound", "SubscriptionClosed", "StaleSubscriptionGeneration",
     "Replica", "ReplicaError", "ReplicaNotReady", "ReplicaGenerationError",
