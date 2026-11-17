@@ -42,3 +42,26 @@ def seed_accounts(client, rows):
 
 def ids(rows):
     return [r["row_id"] for r in rows]
+
+
+def drain_full(client, handle, max_rows=100):
+    """Pull and acknowledge full pages until the explicit end; return items."""
+    items = []
+    while True:
+        batch = client.pull(handle, max_rows=max_rows)["batch"]
+        items.extend(batch["items"])
+        client.ack(handle, batch["batch_id"])
+        if batch["full_complete"]:
+            return items
+
+
+def drain_changes(client, handle, max_rows=100):
+    """Pull and acknowledge incremental batches; return [(position, items)]."""
+    out = []
+    while True:
+        result = client.pull(handle, max_rows=max_rows)
+        if result["batch"] is None:
+            return out
+        batch = result["batch"]
+        out.append((batch["position"], batch["items"]))
+        client.ack(handle, batch["batch_id"])

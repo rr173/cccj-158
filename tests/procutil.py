@@ -81,6 +81,29 @@ class Worker:
     def rows(self, table):
         return self.send({"cmd": "rows", "table": table})["rows"]
 
+    def create_subscription(self, name, tables):
+        out = self.send({"cmd": "create_subscription", "name": name,
+                         "tables": tables})
+        assert out["ok"], out
+        return out
+
+    def pull(self, handle, max_rows=100):
+        return self.send({"cmd": "pull", "handle": handle,
+                          "max_rows": max_rows})
+
+    def pull_ack(self, handle, max_rows=100):
+        return self.send({"cmd": "pull_ack", "handle": handle,
+                          "max_rows": max_rows})
+
+    def subscription_status(self, handle):
+        return self.send({"cmd": "subscription_status", "handle": handle})["status"]
+
+    def cleanup(self):
+        return self.send({"cmd": "cleanup"})["report"]
+
+    def gc(self):
+        return self.send({"cmd": "gc"})["report"]
+
     def close(self):
         if self._closed:
             return

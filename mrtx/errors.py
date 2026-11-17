@@ -48,3 +48,41 @@ class BusyError(ManagedTxError):
 
 class InternalInvariantError(ManagedTxError):
     """A consistency invariant of the store was violated."""
+
+
+class SubscriptionError(ManagedTxError):
+    """A subscription operation is invalid for its durable state.
+
+    Raised for a closed subscription, a stale generation, a wrong token, an
+    acknowledgement that does not match the single pending batch, or an
+    attempt to advance state with a credential that belongs elsewhere.
+    """
+
+
+class SubscriptionNotFound(SubscriptionError):
+    """No subscription with that name/id exists in this source repository."""
+
+
+class ReplicaError(ManagedTxError):
+    """A replica operation violated the replica's local protocol."""
+
+
+class ReplicaNotReady(ReplicaError):
+    """Business reads were attempted before the full delivery completed."""
+
+
+class ReplicaGenerationError(ReplicaError):
+    """The replica holds another subscription generation.
+
+    Reinitialisation is explicit: the caller must decide to discard the old
+    full load instead of mixing it with a new generation's full load.
+    """
+
+
+class SubscriptionClosed(SubscriptionError):
+    """The subscription was closed; it cannot deliver more batches."""
+
+
+class StaleSubscriptionGeneration(SubscriptionError):
+    """A batch/acknowledgement belongs to a superseded subscription generation."""
+

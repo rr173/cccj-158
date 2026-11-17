@@ -22,16 +22,19 @@ library.
 # from the directory containing the mrtx/ package
 python3 -c "import mrtx; print(mrtx.Client)"
 
-# full test suite (stdlib unittest, 53 tests)
+# full test suite (stdlib unittest, 112 tests)
 cd tests && python3 -m unittest discover -s . -p 'test_*.py'
 
-# the runnable end-to-end drill
-python3 -m mrtx.drill
+# the runnable end-to-end drills
+python3 -m mrtx.drill                       # transactions: isolation/conflicts
 python3 -m mrtx.drill --db /tmp/keep.db     # keep the database
+python3 -m mrtx.sync_drill                  # subscriptions + SQLite replica
+python3 -m mrtx.sync_drill --keep /tmp/sync # keep both databases
 ```
 
-The drill exits 0 only if every expectation holds; it prints the actual read
-results, commit decisions, conflict evidence and final rows.
+Each drill exits 0 only if every expectation holds; it prints the actual read
+results, commit decisions, conflict evidence, batch contents, cleanup reports
+and row-by-row replica comparisons.
 
 ---
 
@@ -254,7 +257,112 @@ rejected with evidence rather than retried internally.
 
 ---
 
-## 7. Repository layout
+## 7. Change subscriptions (full-then-incremental)
+
+A subscription is a durable server-side cursor that delivers the committed
+content of a fixed set of managed tables at a fixed cut version `S`, then the
+commits that follow.  It is the building block for a local replica; it never
+runs arbitrary SQL, does no row/column filtering, and assumes no network or
+external message system.
+
+### Creating and using
+
+```python
+from mrtx import Client, Replica
+
+c = Client("source.db")
+sub, S = c.create_subscription("replica-1", ["accounts", "ledger"])
+
+# Full phase: pages of complete S images, ordered by table then row_id.
+batch = c.pull(sub.handle, max_rows=100)["batch"]
+#   batch["phase"]      -> "full"
+#   batch["position"]   -> S (the source position covered)
+#   batch["items"]      -> [{"table","row_id","version","present":True,"values"}]
+#   batch["full_complete"], batch["cursor"], batch["tables"]
+c.ack(sub.handle, batch["batch_id"])          # advance to this batch's position
+
+# After the final full page, pull yields per-commit incremental batches:
+#   batch["phase"]  -> "incremental"; batch["position"] is the covered commit
+#   item -> {"table","row_id","before":{"present",...},"after":{"present",...}}
+# then
+#   {"batch": None, "caught_up": True, "acknowledged_position": ...}
+```
+
+`S` (returned by `create_subscription`, also in `subscription_status`) is
+captured **atomically** with the subscription row, so no concurrent cleanup
+can slip between choosing `S` and taking retention responsibility for it.
+
+### Contract
+
+* **Full load is exactly the S snapshot.** Each row is the newest image with
+  `version <= S`, with `row_id`, its image version and its original typed
+  values (`int64`/`text`/`bool`/`null`).  Concurrent updates, deletes and
+  re-inserts of rows not yet delivered do not change the pages.  Empty
+  subscribed tables are still described (their columns are in the batch's
+  `tables` list and in `subscription_status()["schema"]`).
+* **Pagination** is by `(table name, row_id)` in Unicode code-point order and
+  stops at an explicit `full_complete: true` boundary.  `max_rows` is a soft
+  upper bound for full pages.
+* **Incremental delivery is per source commit**, in commit order.  A commit
+  that changes two subscribed tables arrives as one batch and is applied by a
+  replica in one local transaction.  Multiple staging operations on one
+  identity collapse to the commit's **net** before/after images.  An absent
+  side is tagged `"present": false` with `values: null` and no version — never
+  confused with a business `null`.  A commit with no final row change may be
+  omitted; a value-identical update that bumps the row version is a change.
+  Aborts, orphaned/uncommitted staging and re-sent commits never produce an
+  event.  Unrelated-only and read-only commits neither stall nor skip later
+  relevant commits: a batch's `position` covers them implicitly.
+* **One pending batch.** A batch's `batch_id`, covered position and payload are
+  durable.  Re-pulling from the same or another process, with any budget,
+  returns byte-identical content until it is acknowledged.
+* **Acknowledgement is by batch id only.** There is no client-supplied
+  position.  The advanced position is the one durably recorded when the batch
+  was produced; re-sending an ack is a no-op; a forged, stale, cross-subscription
+  or cross-source credential is rejected.
+* **Generation.** `rebuild_subscription` takes a new `S`, increments the
+  generation and rotates the token; old-generation pull/ack credentials are
+  rejected.  `close_subscription` releases retention responsibility; re-opening
+  a closed subscription raises `SubscriptionClosed`, and a rebuild is the only
+  way to revive it.
+* **Retention and cleanup.** `gc_versions()` retains every version needed to
+  reconstruct `S` while a subscription is in its full phase.
+  `cleanup_sync_history()` prunes the change log up to the **slowest open
+  subscription's** acknowledged position and reports
+  `{"reclaimed_changes", "retention_boundary", "remaining_changes", ...}`.
+  Closed subscriptions and their private pending copies are released.  No
+  long-lived SQLite connection, read transaction or write lock is held while
+  offline or between pages; other processes commit normally between pages.
+
+### Replica
+
+`mrtx.Replica` populates a **separate** SQLite database:
+
+```python
+rep = Replica("replica.db", sub.handle)
+rep.run(c, max_rows=200)          # consume full then incremental
+
+rep.state()["state"]              # "receiving" while the full load streams
+rep.rows("accounts")              # raises ReplicaNotReady until "ready"
+```
+
+* Business reads are refused (`ReplicaNotReady`) until the final full page is
+  applied; then the state becomes `ready`.
+* Each batch is applied in **one local transaction** that also records its
+  `batch_id`.  The source is acknowledged only after that transaction is
+  durable.  A crash between local apply and acknowledgement re-delivers the
+  same batch; the replica recognises it and skips re-applying it.  A version
+  guard also prevents a stale re-delivery from regressing a newer row.
+* This is **not** a cross-database distributed transaction: it is at-least-once
+  delivery plus idempotent local application.  See `Replica.apply_local` /
+  `Replica.acknowledge` to model the crash seam.
+* A changed subscription generation is refused unless you call
+  `prepare_generation(handle)` or `consume(..., reinitialize=True)`, so an old
+  full load is never mixed with a new one.
+
+---
+
+## 8. Repository layout
 
 ```
 mrtx/
@@ -263,21 +371,24 @@ mrtx/
   canonical.py    stable predicate/row encodings for evidence
   store.py        SQLite schema, short transactions, bounded retry, recovery
   engine.py       snapshots, staging, OCC validation, commit/abort, GC
+  subscription.py durable full-then-incremental cursor, retention helpers
+  replica.py      separate-SQLite replica with idempotent local apply
   errors.py       exception types
-  drill.py        runnable end-to-end demonstration
+  drill.py        runnable transaction-level demonstration
+  sync_drill.py   runnable subscription + replica demonstration
 tests/
-  support.py      temp-repo fixtures
+  support.py      temp-repo fixtures and drain helpers
   procutil.py     real OS-process harness (JSON-line pipes)
-  worker.py       child process command loop
+  worker.py       child process command loop (transactions and subscriptions)
   serialcheck.py  independent serializability checker (not used by mrtx)
-  test_*.py       unit, concurrency, process, liveness, randomized tests
+  test_*.py       unit, concurrency, process, subscription and replica tests
 docs/
-  DESIGN.md       design notes and the serializability argument
+  DESIGN.md       design notes, serializability argument, sync retention notes
 ```
 
 ---
 
-## 8. API quick reference
+## 9. API quick reference
 
 ```python
 from mrtx import Client, eq, lt, le, is_null, and_, or_, not_, TRUE, FALSE
@@ -306,6 +417,33 @@ c.history(table, row_id)                 # committed versions of one identity
 c.operations(txid)                       # ordered read/write record
 c.gc_versions()                          # prune unreachable versions safely
 c.recover()                              # decide orphans (dead owners / expired leases)
+
+# --- change subscriptions -------------------------------------------------
+from mrtx import (Subscription, SubscriptionHandle, Replica,
+                  SubscriptionError, SubscriptionNotFound, SubscriptionClosed,
+                  StaleSubscriptionGeneration, ReplicaNotReady,
+                  ReplicaGenerationError)
+
+sub, S = c.create_subscription(name, [table, ...])  # fixed cut S, generation 1
+sub = c.open_subscription(handle)        # resume durable progress; closed -> error
+sub = c.rebuild_subscription(handle)     # new cut, new generation, new token
+c.subscription_status(handle)            # phase, cut, ack position, pending batch
+c.list_subscriptions()
+
+result = c.pull(handle, max_rows=100)    # {"batch": {...}|None, "caught_up": bool}
+c.ack(handle, batch_id)                  # advance to the batch's recorded position
+c.close_subscription(handle)             # release retention responsibility
+c.cleanup_sync_history()                 # prune by slowest open ack; returns report
+
+rep = Replica(replica_path, handle)      # separate SQLite database
+rep.run(c, max_rows=200)                 # full then incremental, idempotently
+rep.apply_local(c) / rep.acknowledge(c)  # expose the crash seam explicitly
+rep.rows(table) / rep.tables() / rep.state()
+rep.prepare_generation(handle)           # explicit reinit on a generation change
 ```
+
+`SubscriptionHandle` (`{sub_id, generation, token, db_path}`) is picklable and
+proves ownership; it is bound to the source path and generation.  Batch ids are
+the only acknowledgement credential; clients never supply positions.
 
 `with c.begin() as tx:` commits on clean exit and aborts on an exception.

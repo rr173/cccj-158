@@ -23,7 +23,7 @@ import time
 from .errors import BusyError, InternalInvariantError, SchemaError
 from .values import COLUMN_TYPES
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 
@@ -131,6 +131,72 @@ BASE_DDL = [
         id INTEGER PRIMARY KEY CHECK (id = 1),
         safe_point INTEGER NOT NULL)
     """,
+    # -- change subscriptions -------------------------------------------------
+    # One durable row per subscription name.  ``generation`` changes only on an
+    # explicit rebuild; batch ids and pulls from an older generation can never
+    # advance this row again.  ``cut_version`` is the fixed snapshot S.
+    """
+    CREATE TABLE IF NOT EXISTS subscriptions (
+        sub_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL,             -- active | closed
+        generation INTEGER NOT NULL,
+        cut_version INTEGER NOT NULL,
+        tables_json TEXT NOT NULL,       -- code-point-sorted subscribed tables
+        schema_json TEXT NOT NULL,       -- frozen descriptors of those tables
+        token_hash TEXT NOT NULL,
+        full_done INTEGER NOT NULL,      -- the S full load has been delivered
+        ack_version INTEGER NOT NULL,    -- last acknowledged source position
+        full_cursor_table TEXT,          -- next table in full pagination
+        full_cursor_row TEXT,            -- next row_id (exclusive) in that table
+        last_acked_batch TEXT,
+        last_acked_position INTEGER,
+        created_wall REAL NOT NULL,
+        updated_wall REAL NOT NULL)
+    """,
+    # At most one unacknowledged batch per subscription.  Its identity and
+    # business content are durable, so re-pulling (any budget, any process)
+    # returns exactly the same batch.
+    """
+    CREATE TABLE IF NOT EXISTS subscription_pending (
+        sub_id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        phase TEXT NOT NULL,             -- full | incremental
+        from_position INTEGER NOT NULL,
+        position INTEGER NOT NULL,       -- source position covered by the batch
+        full_complete INTEGER NOT NULL,
+        manifest_json TEXT NOT NULL,
+        created_wall REAL NOT NULL)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS subscription_items (
+        sub_id TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        item_json TEXT NOT NULL,
+        PRIMARY KEY (sub_id, seq))
+    """,
+    # Source-commit change log for tables covered by at least one open
+    # subscription.  Written in the same short commit transaction as the row
+    # versions and the durable commit decision, so it can never contain an
+    # aborted or uncommitted change.  Pruned by cleanup_sync_history() only up
+    # to the slowest open subscription's acknowledged position.
+    """
+    CREATE TABLE IF NOT EXISTS sub_changes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        commit_version INTEGER NOT NULL,
+        user_txid TEXT NOT NULL,
+        table_name TEXT NOT NULL,
+        row_id TEXT NOT NULL,
+        old_present INTEGER NOT NULL,
+        old_values TEXT,
+        old_version INTEGER,
+        new_present INTEGER NOT NULL,
+        new_values TEXT,
+        new_version INTEGER)
+    """,
+    "CREATE INDEX IF NOT EXISTS sub_changes_by_version ON sub_changes(commit_version, id)",
+    "CREATE INDEX IF NOT EXISTS sub_changes_by_table ON sub_changes(table_name, commit_version)",
 ]
 
 
@@ -239,8 +305,18 @@ class Store:
         if self._schema_is_current():
             return
 
+        # ``journal_mode`` cannot be changed from inside a transaction.  On a
+        # fresh database this is a no-op before any page exists, but on an
+        # existing database that merely needs a schema upgrade it must happen
+        # outside the short write transaction below.
+        probe = self.connect()
+        try:
+            self._configure(probe)
+            probe.execute("PRAGMA journal_mode = WAL")
+        finally:
+            probe.close()
+
         def _init(conn):
-            conn.execute("PRAGMA journal_mode = WAL")
             for ddl in BASE_DDL:
                 conn.execute(ddl)
             row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
@@ -249,6 +325,11 @@ class Store:
                              (str(SCHEMA_VERSION),))
                 conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('seq', '0')")
                 conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('commit_version', '0')")
+            elif int(row[0]) == 1:
+                # v1 -> v2 only adds the subscription tables; BASE_DDL has
+                # already created them with IF NOT EXISTS.
+                conn.execute("UPDATE meta SET value=? WHERE key='schema_version'",
+                             (str(SCHEMA_VERSION),))
             elif int(row[0]) != SCHEMA_VERSION:
                 raise InternalInvariantError(
                     "unsupported schema version %s (expected %d)" % (row[0], SCHEMA_VERSION))

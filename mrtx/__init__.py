@@ -18,7 +18,12 @@ See ``docs/DESIGN.md`` for the isolation and conflict rules.
 
 from .engine import Client, Transaction, TransactionHandle, new_txid
 from .errors import (ConflictError, ManagedTxError, PredicateError, SchemaError,
-                     TransactionError, TransactionNotFound, BusyError)
+                     TransactionError, TransactionNotFound, BusyError,
+                     SubscriptionError, SubscriptionNotFound, SubscriptionClosed,
+                     StaleSubscriptionGeneration, ReplicaError, ReplicaNotReady,
+                     ReplicaGenerationError)
+from .subscription import Subscription, SubscriptionHandle
+from .replica import Replica
 from .values import (And, Atom, FALSE, LiteralFalse, LiteralTrue, Not, Or, TRUE,
                      and_, eq, is_null, le, lt, not_, or_)
 
@@ -26,6 +31,9 @@ __all__ = [
     "Client", "Transaction", "TransactionHandle", "new_txid",
     "ConflictError", "ManagedTxError", "PredicateError", "SchemaError",
     "TransactionError", "TransactionNotFound", "BusyError",
+    "Subscription", "SubscriptionHandle", "SubscriptionError",
+    "SubscriptionNotFound", "SubscriptionClosed", "StaleSubscriptionGeneration",
+    "Replica", "ReplicaError", "ReplicaNotReady", "ReplicaGenerationError",
     "Atom", "And", "Or", "Not", "TRUE", "FALSE", "LiteralTrue", "LiteralFalse",
     "eq", "lt", "le", "is_null", "and_", "or_", "not_",
 ]

@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mrtx import Client, ConflictError, ManagedTxError  # noqa: E402
 from mrtx.engine import TransactionHandle  # noqa: E402
+from mrtx.subscription import SubscriptionHandle  # noqa: E402
 
 
 def _pred(desc):
@@ -87,6 +88,34 @@ def handle_command(client, handles, cmd):
         return {"ok": True, "result": tx.abort()}
     if name == "status":
         return {"ok": True, "status": client.transaction_status(cmd["txid"])}
+    if name == "create_subscription":
+        sub, cut = client.create_subscription(cmd["name"], cmd["tables"])
+        return {"ok": True, "cut": cut, "handle": sub.handle.as_dict()}
+    if name == "pull":
+        out = client.pull(SubscriptionHandle.from_dict(cmd["handle"]),
+                          max_rows=cmd.get("max_rows", 100))
+        return {"ok": True, "result": out}
+    if name == "ack":
+        out = client.ack(SubscriptionHandle.from_dict(cmd["handle"]),
+                         cmd["batch_id"])
+        return {"ok": True, "result": out}
+    if name == "pull_ack":
+        # Pull one batch and acknowledge it atomically from the parent's
+        # point of view; used to drain pages in a child process.
+        handle = SubscriptionHandle.from_dict(cmd["handle"])
+        out = client.pull(handle, max_rows=cmd.get("max_rows", 100))
+        if out["batch"] is None:
+            return {"ok": True, "caught_up": True}
+        client.ack(handle, out["batch"]["batch_id"])
+        return {"ok": True, "batch": out["batch"]}
+    if name == "subscription_status":
+        return {"ok": True,
+                "status": client.subscription_status(
+                    SubscriptionHandle.from_dict(cmd["handle"]))}
+    if name == "cleanup":
+        return {"ok": True, "report": client.cleanup_sync_history()}
+    if name == "gc":
+        return {"ok": True, "report": client.gc_versions()}
     if name == "rows":
         return {"ok": True, "rows": client.rows(cmd["table"])}
     if name == "exit":

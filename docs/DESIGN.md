@@ -112,3 +112,92 @@ reads are deferred snapshots with `PRAGMA query_only`.  `busy`/`locked`
 errors are retried with jittered exponential backoff and then raised as
 `BusyError`, which has no `evidence` attribute and creates no decision.  A
 test holds an external SQLite write lock to confirm this behaviour.
+
+## 6. Change subscriptions: full-then-incremental hand-off
+
+### Durable cursor and the two-phase delivery
+
+A subscription row fixes three things in one `BEGIN IMMEDIATE` transaction:
+its `sub_id`/token, generation 1, and the cut `S = meta.commit_version`.  Doing
+all three together closes the window in which a concurrent commit could land
+*after* `S` was read but *before* retention responsibility existed: because
+the write lock is held, a concurrent committer either commits entirely before
+`S` (and is part of the full load) or entirely after the subscription row is
+durable (and is logged for the incremental phase).
+
+The full phase is a keyset scan over the append-only history: for each
+subscribed table, per `row_id`, the newest version `<= S`, tombstones removed,
+ordered by `(row_id)` and tables in code-point order.  Because it filters on
+`S` rather than "now", updates/deletes/re-inserts that happen between pages do
+not alter not-yet-delivered rows.  The scan is one short read transaction per
+page; no connection or lock spans pages, so other processes commit normally
+between pages.
+
+The incremental phase reads `sub_changes`, the commit-time change log.  The
+engine writes one row per identity per committed transaction *in the same
+atomic commit* that appends the row versions and the durable decision, but
+only for tables covered by some open subscription.  A transaction that staged
+the same identity several times has already been folded to one effective
+image by `_staged_effective`, so the log holds the commit's net before/after
+images.  A pure insert-then-delete of a new identity is omitted (no final
+change).  Because the log is written with the commit, aborts, orphans and
+resent commits can never appear in it.
+
+Batches are produced one source commit at a time.  The batch's `position` is
+that commit's `commit_version`; its `from_position` is the acknowledged
+position it extends.  Commits that changed no subscribed table (unrelated or
+read-only) are skipped by the `MIN(commit_version) ... table_name IN (...)`
+query, so they neither block nor cause a skip of a later relevant commit — the
+later batch's position simply covers them.
+
+### Single pending batch and acknowledgement
+
+`subscription_pending` + `subscription_items` hold at most one batch per
+subscription.  A pull first returns that batch unchanged; only after an
+acknowledgement is it deleted and the next one built.  An acknowledgement is
+`(sub_id, batch_id)` only.  The position advanced is read from the pending
+row's durable `position` — a client cannot name a position.  The token proves
+ownership and is bound to the source path and generation.  Re-sending an ack
+for the last acknowledged batch hits the replay branch and writes nothing.
+
+`rebuild_subscription` (explicit only) deletes the pending copy, increments
+the generation, rotates the token and captures a new `S`; the old handle's
+generation no longer matches, so old pull/ack credentials fail.  `close`
+sets the state to `closed` and drops the private pending copy; a closed
+subscription is excluded from retention calculations and from the commit-time
+watch set, and `open_subscription` refuses it while `rebuild` can revive it.
+
+### Retention
+
+Two needs are derived from open subscriptions:
+
+1. **Full phase needs row history at `S`.**  `gc_versions` treats each
+   unfinalised subscription's cut like a live read snapshot at `S` and includes
+   it in the `min` that defines the safe point.  When the full load finishes,
+   that need disappears.
+2. **Incremental phase needs `sub_changes > ack`.**  `cleanup_sync_history`
+   computes `boundary = min(ack_version)` over all open subscriptions and
+   deletes `sub_changes` with `commit_version <= boundary`; with no open
+   subscription the whole log is reclaimable.  Using the minimum (not the
+   fastest consumer) means a slow consumer never loses a change.  The report
+   states the reclaimed count and the honoured boundary; cleanup is real
+   reclamation, not a "never delete" policy.
+
+There is no private full-load copy: the full load reads the same history that
+`gc_versions` already knows how to retain, so there is nothing extra to release
+at the end.  The only private per-subscription state is the (at most one)
+pending batch, which is deleted on ack and on close.
+
+### Replica recovery
+
+A replica is a separate SQLite file.  Applying a batch is one local
+`BEGIN IMMEDIATE` that writes the row images and inserts the `batch_id` into
+`replica_applied`.  The source ack happens only after that commit.  If the
+process dies in between, the source still has the batch pending, so the same
+batch is re-pulled; the replica sees the `batch_id` already present, records
+that it replayed it, and does not re-apply.  This is at-least-once delivery
+plus an idempotent local apply — not a cross-database atomic commit.  A
+version guard in the row writer is a second line of defence: an older image
+never overwrites a newer one.  A generation change is refused unless the
+caller explicitly reinitialises, so the old full load and a new full load are
+never interleaved.

@@ -61,6 +61,7 @@ import secrets
 import time
 
 from . import canonical
+from . import subscription as subscription_mod
 from .errors import ConflictError, SchemaError, TransactionError, TransactionNotFound
 from .store import Store, hist_table
 from .values import (TYPE_BOOL, check_value, columns_used, compile_predicate,
@@ -573,6 +574,10 @@ class Client:
         commit_version = Store.bump_commit_version(conn)
         writes = []
         ordinal = 0
+        # Tables that some open subscription currently covers.  Change-log
+        # rows for exactly these tables are appended in this same atomic
+        # commit, so an aborted/uncommitted staging can never enter the log.
+        watched = subscription_mod.watched_tables(conn)
         tables = [r[0] for r in conn.execute(
             "SELECT DISTINCT table_name FROM staged WHERE user_txid=? ORDER BY table_name",
             (handle.txid,))]
@@ -601,6 +606,26 @@ class Client:
                      canonical.values_to_json(new_values)
                      if new_values is not None else None,
                      eff["base_version"], commit_version, commit_version))
+                if table in watched:
+                    # A change with no net final effect (insert+delete of a
+                    # brand-new identity inside one transaction) is omitted.
+                    no_final_change = (
+                        eff["old_values"] is None and new_values is None)
+                    if not no_final_change:
+                        conn.execute(
+                            "INSERT INTO sub_changes(commit_version, user_txid, "
+                            "table_name, row_id, old_present, old_values, old_version, "
+                            "new_present, new_values, new_version) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (commit_version, handle.txid, table, rid,
+                             1 if eff["old_values"] is not None else 0,
+                             canonical.values_to_json(eff["old_values"])
+                             if eff["old_values"] is not None else None,
+                             eff["base_version"],
+                             1 if new_values is not None else 0,
+                             canonical.values_to_json(new_values)
+                             if new_values is not None else None,
+                             commit_version))
                 writes.append({"ordinal": ordinal, "table": table, "row_id": rid,
                                "op": eff["op"], "base_version": eff["base_version"],
                                "old_values": eff["old_values"],
@@ -1011,6 +1036,11 @@ class Client:
             for r in active:
                 if _owner_alive_by_txid(conn, r["user_txid"]):
                     live.append(r["base_version"])
+            # A subscription still in its full phase reconstructs its cut
+            # snapshot S directly from row history; that need is exactly like
+            # a live read snapshot at S.
+            full_cuts = subscription_mod.full_phase_snapshots(conn)
+            live.extend(full_cuts)
             safe = min(live) if live else current
             removed = 0
             for (table,) in conn.execute("SELECT table_name FROM tables").fetchall():
@@ -1034,7 +1064,8 @@ class Client:
                                          % hist, (rid, v))
                             removed += 1
             return {"safe_version": safe, "pruned_versions": removed,
-                    "active_snapshots": sorted(set(live))}
+                    "active_snapshots": sorted(set(live)),
+                    "full_phase_cuts": sorted(set(full_cuts))}
         return self.store.run_tx(_gc)
 
     # -- introspection -------------------------------------------------------
@@ -1110,6 +1141,40 @@ class Client:
             return {"code": row["code"], "at_wall": row["at_wall"],
                     "evidence": json.loads(row["evidence_json"])}
         return self.store.run_tx(_q, readonly=True)
+
+    # -- change subscriptions -------------------------------------------------
+
+    def create_subscription(self, name, tables):
+        """Create a subscription and fix its cut version atomically."""
+        return subscription_mod.create(self, name, tables)
+
+    def open_subscription(self, handle):
+        """Re-open a persisted handle, resuming its durable progress."""
+        return subscription_mod.open_subscription(self, handle)
+
+    def subscription_status(self, handle):
+        return subscription_mod.status(self, handle)
+
+    def list_subscriptions(self):
+        return subscription_mod.list_subscriptions(self)
+
+    def pull(self, handle, max_rows=100):
+        """Return the single pending batch, or durably produce the next one."""
+        return subscription_mod.pull(self, handle, max_rows=max_rows)
+
+    def ack(self, handle, batch_id):
+        """Acknowledge only the batch id; the covered position is durable."""
+        return subscription_mod.ack(self, handle, batch_id)
+
+    def close_subscription(self, handle):
+        return subscription_mod.close(self, handle)
+
+    def rebuild_subscription(self, handle):
+        return subscription_mod.rebuild(self, handle)
+
+    def cleanup_sync_history(self):
+        """Reclaim change-log entries no open subscription can still need."""
+        return subscription_mod.cleanup_sync_history(self)
 
 
 def returned_ids(rd):
