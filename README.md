@@ -4,8 +4,11 @@ A from-scratch, SQLite-backed transaction layer with a public
 `begin / read / stage_insert / stage_update / stage_delete / commit / abort`
 API.  It provides genuine snapshot isolation for user transactions that can
 live in different OS processes, a conservative but *evidence-carrying*
-serializability check, durable all-or-nothing commit decisions, and safe
-version cleanup.
+serializability check, durable all-or-nothing commit decisions, safe
+version cleanup, online one-column migrations, managed reference constraints
+with commit-time cascades, change subscriptions with SQLite replicas, and
+disk-backed materialized join-aggregate summaries that are maintained inside
+each source commit.
 
 It manages only data written through this module.  It does not execute
 arbitrary SQL and does not implement distributed transactions.
@@ -22,7 +25,7 @@ library.
 # from the directory containing the mrtx/ package
 python3 -c "import mrtx; print(mrtx.Client)"
 
-# full test suite (stdlib unittest, 184 tests)
+# full test suite (stdlib unittest, 218 tests)
 cd tests && python3 -m unittest discover -s . -p 'test_*.py'
 
 # the runnable end-to-end drills
@@ -33,6 +36,8 @@ python3 -m mrtx.sync_drill --keep /tmp/sync # keep both databases
 python3 -m mrtx.online_add_column_drill     # online add-column migration
 python3 -m mrtx.reference_drill             # reference constraints + cascades
 python3 -m mrtx.reference_drill --keep /tmp/ref
+python3 -m mrtx.materialized_drill          # materialized join-aggregate summaries
+python3 -m mrtx.materialized_drill --keep /tmp/mv
 ```
 
 Each drill exits 0 only if every expectation holds; it prints the actual read
@@ -566,6 +571,8 @@ mrtx/
                   versioned column catalog and online add_column
   engine.py       snapshots, staging, OCC validation, commit/abort, GC
   references.py   durable reference catalog, deferred checks, cascade planner
+  materialize.py  materialized-summary definitions, paged builds, key-scoped
+                  incremental maintenance, stable group identity, stats
   subscription.py durable full-then-incremental cursor, schema-change stream
   replica.py      separate-SQLite replica with idempotent local apply
   errors.py       exception types
@@ -573,8 +580,10 @@ mrtx/
   sync_drill.py   runnable subscription + replica demonstration
   online_add_column_drill.py  runnable online-migration demonstration
   reference_drill.py          runnable reference-constraint demonstration
+  materialized_drill.py       runnable materialized-summary demonstration
 tests/
   support.py      temp-repo fixtures and drain helpers
+  mv_naive.py     independent naive join-aggregate reference (not product code)
   procutil.py     real OS-process harness (JSON-line pipes)
   worker.py       child process command loop (transactions and subscriptions)
   serialcheck.py  independent serializability checker (not used by mrtx)
@@ -585,6 +594,138 @@ docs/
 ```
 
 ---
+
+## 11. Materialized join-aggregate summaries
+
+A materialized summary is a named, **read-only** managed table that is kept
+permanently in sync with a restricted declaration over two *different ordinary
+managed tables*.  You register the declaration once, build it online with a
+bounded budget, and afterwards every source commit maintains it inside the same
+atomic transaction at the same source position.
+
+### 11.1 The restricted declaration
+
+A definition names:
+
+* two different ordinary managed tables and one **text** join column on each;
+* an `inner` or `left` join;
+* a non-empty list of **group columns**, each a column of either side with a
+  caller-chosen output alias;
+* one or more aggregates with aliases: `count_star`, `count(column)` and
+  `sum(int64 column)`, where the column may come from either side.
+
+There is deliberately no arbitrary SQL, no expression, no filter, no self join
+and no stacking of one materialized table on top of another.  Malformed
+declarations (unknown columns/types, non-text join columns, a SUM of a
+non-int64 column, duplicate or reserved aliases, an existing name) are refused
+before any build structure exists, and an existing name can never silently
+acquire a different definition.
+
+Join semantics are exactly the documented ones:
+
+* matching is exact non-null **text** equality; two null join values never
+  match each other;
+* there is no de-duplication, so `m` left rows and `n` right rows on one key
+  really contribute `m * n` join rows (the nested aggregation streams one join
+  row at a time and never builds that list);
+* in `left` mode an unmatched left row contributes one row with the right side
+  entirely null; in `inner` mode it is dropped;
+* `COUNT(*)` counts join rows, `COUNT(column)` ignores nulls, and `SUM` ignores
+  nulls and returns null when every value was null;
+* group tuples keep the original types — bool stays distinct from int, null
+  stays distinct from the empty text (the tuple is encoded as ordered JSON, not
+  separator-concatenated strings); empty groups are never stored.
+
+### 11.2 Online, resumable, disk-backed initial build
+
+`define_materialized_summary` only persists the declaration (state
+`defined`).  `start_materialized_build` fixes one source cut **V** and creates
+the on-disk build structures; the build then advances one short transaction at
+a time through `build_materialized_step(name, budget)`, so:
+
+* no transaction or connection is held across pages and a real process can
+  commit between pages, exit, and resume in another process from the durable
+  cursor;
+* both pagination cursors are anchored at the same cut, so the two source
+  tables can never mix values from different source positions;
+* large scans, the association output and the build state live on disk
+  (`materialized_accum`, `materialized_group_keys`, `materialized_groups`),
+  not in memory.
+
+Commits that land while the build is running are caught up one source position
+at a time after the cut scan, using the same key-scoped maintenance as steady
+state.  When the maintained position reaches the current source position the
+output is **published at one explicit source position V** — that is the first
+version at which the summary is readable; until then reads and subscriptions
+raise `MaterializedNotReady`.  `cancel_materialized_build` drops an inactive
+build, its physical output table and its auxiliary rows, releases the shared
+join indexes, and frees its GC retention; the definition row stays so the name
+cannot be reused.
+
+### 11.3 Key-scoped incremental maintenance
+
+After activation, each source commit maintains every affected summary **inside
+the commit's own `BEGIN IMMEDIATE` transaction**, computed from the commit's
+complete net change (explicit writes plus implicit cascade deletes).  Only the
+join keys the commit changes are touched:
+
+1. the changed non-null keys (and, in left mode, the null scope) identify the
+   groups they currently feed through the durable `materialized_group_keys`
+   membership;
+2. the full join-key universe of those groups is loaded (indexed lookups, never
+   a full table scan) in both the pre-commit and post-commit states;
+3. the affected groups are recomputed in both states and replaced wholesale,
+   so a group fed by several join keys is always correct even when only one key
+   changed, and a two-sided commit is never counted twice.
+
+The maintenance statistics (`materialized_maintenance_stats`) report, per
+commit, the source rows read, the auxiliary records read and the groups
+written — including reads done only to check whether a value changed — so the
+key-scoped cost is verifiable rather than asserted.  Normal engine transaction
+validation reads are separate and not charged to these counters.
+
+Int64 safety is decided on the **final** group totals only.  The intermediate
+arithmetic is ordinary Python integer arithmetic, so a subtract-then-add
+sequence can transiently leave the int64 range without a false alarm, while a
+genuinely out-of-range final count or total raises a `materialized_overflow`
+conflict that rejects the whole source commit before any summary row becomes
+visible.
+
+### 11.4 Stable group identity and row versioning
+
+Each distinct group tuple gets a stable token (the output row's `row_id`)
+allocated once from a monotonically increasing sequence and **retained while
+the group is inactive**.  A group that disappears and later reappears therefore
+keeps the same identity, and two different groups never share one.  The mapping
+is public in both directions:
+
+```python
+c.materialized_group_identity(name, group_tuple)   # -> row_id + active flag
+c.materialized_tuple_for_identity(name, token)     # -> typed tuple
+c.list_materialized_group_identities(name)         # active and inactive groups
+```
+
+The output table has the same append-only `(row_id, version, deleted)` shape as
+an ordinary managed table.  A group whose business values did not change gets
+**no new row version and no subscription event**, although the maintenance
+progress and statistics are still durably saved; a changed group appends a new
+version, and a disappearing group appends a tombstone.
+
+### 11.5 Read-only table, reuse of the existing machinery
+
+Because the physical output is an ordinary append-only history table, every
+existing mechanism serves it unchanged: a transaction's fixed start view and
+predicate validation, read-invalidation conflicts (including empty-predicate
+phantoms), subscriptions and replicas, and version GC.  Clients cannot stage
+writes into it, cannot run an online `add_column` on it, and cannot use it as
+either end of a reference constraint; an `add_column` on an unrelated source
+table does not alter a frozen definition or its results.  A subscription may
+mix source tables and active summaries, so a subscriber sees the source and
+summary net changes of one commit in a single per-commit batch, and a replica
+applies the already-computed summary rows without re-deriving anything.
+
+---
+
 
 ## 11. API quick reference
 
@@ -652,6 +793,37 @@ rep.run(c, max_rows=200)                 # full then incremental, idempotently
 rep.apply_local(c) / rep.acknowledge(c)  # expose the crash seam explicitly
 rep.rows(table) / rep.tables() / rep.state()
 rep.prepare_generation(handle)           # explicit reinit on a generation change
+
+# --- materialized join-aggregate summaries --------------------------------
+from mrtx import MaterializedError, MaterializedNotReady
+
+# Restricted declaration only: two different ordinary tables, one text join
+# column each, inner/left join, typed group columns, COUNT(*)/COUNT(col)/
+# SUM(int64 col) with output aliases.  No SQL, expressions, filters or self
+# joins.  define() persists the declaration; nothing is built yet.
+c.define_materialized_summary(
+    name, left_table, right_table, left_join_column, right_join_column,
+    join_kind,                              # "inner" | "left"
+    groups=[{"table": "left"|"right", "column": ..., "alias": ...}, ...],
+    aggregates=[{"fn": "count_star", "alias": ...},
+                {"fn": "count", "column": {"table": ..., "column": ...},
+                 "alias": ...},
+                {"fn": "sum", "column": {"table": ..., "column": ...},
+                 "alias": ...}])
+c.start_materialized_build(name)          # fix the cut V; create disk structures
+c.build_materialized_step(name, budget=N) # one paged, independently committable step
+c.materialized_status(name)               # state, cut, maintained position, progress
+c.cancel_materialized_build(name)         # only while not active; releases retention
+c.list_materialized_summaries()
+c.get_materialized_summary(name)
+
+# After activation the summary is a normal read-only managed table:
+rows = tx.read(name, columns=None, where=None)   # fixed start view + predicates
+c.rows(name)                                     # verification helper
+c.materialized_group_identity(name, group_tuple) # tuple -> stable row_id
+c.materialized_tuple_for_identity(name, token)   # row_id -> typed tuple
+c.list_materialized_group_identities(name)        # active + retained inactive groups
+c.materialized_maintenance_stats(name)            # source rows / helper rows / groups
 ```
 
 `SubscriptionHandle` (`{sub_id, generation, token, db_path}`) is picklable and

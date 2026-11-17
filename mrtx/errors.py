@@ -119,3 +119,20 @@ class ReferenceError(SchemaError):
     they are :class:`ConflictError` rejections carrying reference evidence.
     """
 
+
+class MaterializedError(ManagedTxError):
+    """A materialized-summary definition, build or maintenance call was invalid.
+
+    Raised for a malformed restricted declaration, an attempt to use an
+    inactive (still building or cancelled) materialized table, a read-only
+    violation (staging writes, online add-column or using it as one end of a
+    reference constraint), or a build whose aggregates cannot be represented.
+    Commit-time int64 overflow of the maintained totals is *not* this error:
+    it is a :class:`ConflictError` rejection (``materialized_overflow``) so the
+    whole source commit is refused atomically.
+    """
+
+
+class MaterializedNotReady(MaterializedError):
+    """The materialized summary is still building and cannot be read yet."""
+

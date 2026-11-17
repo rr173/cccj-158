@@ -63,11 +63,12 @@ import time
 from . import canonical
 from . import references as refs_mod
 from . import subscription as subscription_mod
-from .errors import (ConflictError, SchemaConflictError, SchemaError,
-                     TransactionError, TransactionNotFound)
+from . import materialize as mv_mod
+from .errors import (ConflictError, MaterializedError, SchemaConflictError,
+                     SchemaError, TransactionError, TransactionNotFound)
 from .store import Store, hist_table
-from .values import (TYPE_BOOL, check_value, columns_used, compile_predicate,
-                     returns_true)
+from .values import (TRUE, TYPE_BOOL, check_value, columns_used,
+                     compile_predicate, returns_true)
 
 ACTIVE = "active"
 COMMITTED = "committed"
@@ -325,6 +326,60 @@ class Client:
         """One durable constraint record, or ``None`` when the name is unknown."""
         return refs_mod.get_constraint(self, name)
 
+    # -- materialized join-aggregate summaries ------------------------------
+
+    def define_materialized_summary(self, name, left_table, right_table,
+                                    left_join_column, right_join_column,
+                                    join_kind, groups, aggregates):
+        """Register one restricted materialized-summary declaration.
+
+        Only the declaration is persisted (state ``defined``); no data is read
+        or built yet.  Malformed declarations (unknown columns/types, bad
+        aliases, duplicate output names, non-text join columns, same table on
+        both sides, an unsupported aggregate, an existing name) are refused
+        before any build structure exists.
+        """
+        return mv_mod.validate_and_define(
+            self, name, left_table, right_table, left_join_column,
+            right_join_column, join_kind, groups, aggregates)
+
+    def start_materialized_build(self, name):
+        """Fix the build cut and create the on-disk build/output structures."""
+        return mv_mod.start_build(self, name)
+
+    def build_materialized_step(self, name, budget=500):
+        """Advance the build by one paged, independently committable step."""
+        return mv_mod.build_step(self, name, budget=budget)
+
+    def materialized_status(self, name):
+        """Durable definition, build progress and maintained source position."""
+        return mv_mod.build_status(self, name)
+
+    def list_materialized_summaries(self):
+        return mv_mod.list_defs(self)
+
+    def get_materialized_summary(self, name):
+        return mv_mod.get_def(self, name)
+
+    def cancel_materialized_build(self, name):
+        """Cancel an inactive build and release its retention responsibility."""
+        return mv_mod.cancel_build(self, name)
+
+    def materialized_group_identity(self, name, group_tuple):
+        """Map a typed group tuple to its stable output row identity."""
+        return mv_mod.group_identity(self, name, group_tuple)
+
+    def materialized_tuple_for_identity(self, name, token):
+        """Reverse mapping: the typed group tuple behind an output row id."""
+        return mv_mod.tuple_for_identity(self, name, token)
+
+    def list_materialized_group_identities(self, name, include_inactive=True):
+        return mv_mod.list_group_identities(self, name, include_inactive)
+
+    def materialized_maintenance_stats(self, name=None, limit=50):
+        """Verifiable per-commit maintenance counters."""
+        return mv_mod.maintenance_stats(self, name=name, limit=limit)
+
     # -- begin ---------------------------------------------------------------
 
     def begin(self, txid=None):
@@ -448,6 +503,46 @@ class Client:
         def _read(conn):
             tx = self._load(conn, handle, need_active=True)
             version = tx["base_version"]
+            if mv_mod.is_materialized(conn, table):
+                # Read-only managed table: the output history has the same
+                # physical shape as an ordinary table, so the fixed start
+                # view, predicate validation and read-invalidation evidence
+                # all work unchanged.
+                descriptors = mv_mod.output_schema(conn, table)
+                columns_map = {c["name"]: c["type"] for c in descriptors}
+                pred = compile_predicate(where, columns_map)
+                if columns is None:
+                    selected = list(columns_map)
+                else:
+                    if not isinstance(columns, (list, tuple)) or not columns:
+                        raise SchemaError("columns must be a non-empty list of whitelisted names")
+                    selected = []
+                    for name in columns:
+                        if name != "row_id" and name not in columns_map:
+                            raise SchemaError("unknown column %r on %s" % (name, table))
+                        if name not in selected:
+                            selected.append(name)
+                out, ordered_types = mv_mod.read_rows(
+                    conn, table, version, selected, pred, _predicate_holds,
+                    lambda r, cols: _row_dict(r, cols))
+                record = {"table": table,
+                          "predicate": canonical.predicate_text(pred),
+                          "description": canonical.describe(pred),
+                          "columns": selected,
+                          "returned": out,
+                          "empty": not out,
+                          "snapshot_version": version}
+                conn.execute(
+                    "INSERT INTO predicate_reads(user_txid, table_name, predicate_json, "
+                    "description, rows_json, columns_json, returns_empty, snapshot_version, "
+                    "read_wall) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (handle.txid, table, record["predicate"],
+                     json.dumps(record["description"], sort_keys=True),
+                     canonical.values_to_json(out), json.dumps(selected),
+                     1 if not out else 0, version, time.time()))
+                self._log_op(conn, handle.txid, "read", table, record)
+                self._touch_lease(conn, handle.txid)
+                return out
             # Resolve the column definition fixed at the transaction's start
             # view.  A read never sees a column added by a later migration.
             columns_map, _defaults = self.store.schema_at_conn(conn, table, version)
@@ -532,6 +627,10 @@ class Client:
 
         def _do(conn):
             self._load(conn, handle, need_active=True)
+            if mv_mod.is_materialized(conn, table):
+                raise MaterializedError(
+                    "materialized summary %r is read-only; client staging writes are "
+                    "not allowed" % table)
             base_version = self._load(conn, handle)["base_version"]
             # The transaction's structural start view: the column definition
             # (and declared defaults) fixed at begin time.
@@ -779,6 +878,17 @@ class Client:
             return self._record_rejection(conn, handle, base_version, ref_problems)
         cascade_keys = {(item["table"], item["row_id"]) for item in cascade}
 
+        # Materialized summaries are maintained from the commit's complete net
+        # change (explicit writes plus implicit cascade deletes), planned
+        # before the source position is consumed so a final int64 overflow can
+        # reject the whole commit without leaving a half-maintained view.
+        source_changes = self._materialized_change_set(conn, handle, cascade)
+        provisional_version = Store.current_commit_version(conn) + 1
+        mv_plans, mv_problems = mv_mod.plan_commit(
+            conn, self, source_changes, provisional_version)
+        if mv_problems:
+            return self._record_rejection(conn, handle, base_version, mv_problems)
+
         commit_version = Store.bump_commit_version(conn)
         writes = []
         ordinal = 0
@@ -901,7 +1011,14 @@ class Client:
              "old_version": item["old_version"], "commit_version": commit_version,
              "propagation_source": [item["parent_table"], item["parent_id"]]}
             for item in cascade]
+        # Apply every affected materialized summary in this same atomic
+        # transaction, at the same source position.  Output rows, write
+        # evidence, subscription changes and on-disk auxiliary state all commit
+        # or roll back together with the source decision.
+        mv_reports = mv_mod.apply_commit(
+            conn, mv_plans, commit_version, watched, handle.txid)
         evidence = {"writes": writes, "cascade_deletes": cascade_report,
+                    "materialized": mv_reports,
                     "base_version": base_version, "commit_version": commit_version}
         conn.execute("INSERT INTO decisions(user_txid, decision, commit_version, decided_wall, "
                      "evidence_json) VALUES (?, 'committed', ?, ?, ?)",
@@ -913,7 +1030,39 @@ class Client:
         conn.execute("DELETE FROM gc_leases WHERE user_txid=?", (handle.txid,))
         return {"txid": handle.txid, "status": COMMITTED,
                 "commit_version": commit_version, "writes": writes,
-                "cascade_deletes": cascade_report, "replayed": False}
+                "cascade_deletes": cascade_report,
+                "materialized": mv_reports, "replayed": False}
+
+    def _materialized_change_set(self, conn, handle, cascade):
+        """Folded per-identity net change of this commit, cascade included.
+
+        One entry per touched ordinary table/identity, with the true
+        pre-commit image (``old`` -- the identity's image at the transaction's
+        fixed start view) and the final image (``new``; ``None`` for a delete).
+        Using each identity's folded effective change (rather than merging
+        individual staging ops) keeps key migrations honest: a row whose join
+        key moves null -> non-null or between two keys carries both its real
+        old key and its real new key in one record.  Explicit writes and
+        implicit cascade deletes are merged so maintenance never counts a
+        two-sided change twice.
+        """
+        changes = {}
+
+        def put(table, rid, old, new):
+            changes.setdefault(table, {})[rid] = {"old": old, "new": new}
+
+        for table in [r[0] for r in conn.execute(
+                "SELECT DISTINCT table_name FROM staged WHERE user_txid=? ORDER BY table_name",
+                (handle.txid,))]:
+            for rid, eff in self._staged_for_table(conn, handle.txid, table):
+                put(table, rid, eff["old_values"],
+                    None if eff["op"] == "delete" else eff["new_values"])
+        for item in cascade:
+            if item["ephemeral"]:
+                # Never existed in committed state: nothing to maintain.
+                continue
+            put(item["table"], item["row_id"], item["old_values"], None)
+        return changes
 
     def _record_rejection(self, conn, handle, base_version, problems):
         # Audit evidence covers every transaction with recorded reads or
@@ -1312,6 +1461,10 @@ class Client:
             # a live read snapshot at S.
             full_cuts = subscription_mod.full_phase_snapshots(conn)
             live.extend(full_cuts)
+            # A materialized-summary build pinned at its cut must keep the
+            # source history its paged scan and catch-up still read.  The
+            # responsibility is released on activation or cancellation.
+            live.extend(mv_mod.build_phase_snapshots(conn))
             safe = min(live) if live else current
             removed = 0
             for (table,) in conn.execute("SELECT table_name FROM tables").fetchall():
@@ -1371,6 +1524,13 @@ class Client:
         """Latest committed images, ordered by row_id (verification helper)."""
         def _q(conn):
             version = Store.current_commit_version(conn)
+            if mv_mod.is_materialized(conn, table):
+                descriptors = mv_mod.output_schema(conn, table)
+                types = {d["name"]: d["type"] for d in descriptors}
+                out_rows, _ordered = mv_mod.read_rows(
+                    conn, table, version, list(types), TRUE,
+                    _predicate_holds, lambda r, cols: _row_dict(r, cols))
+                return out_rows
             out = []
             for rid, ver, vals in self._visible_rows(conn, table, version):
                 row = {"row_id": rid, "version": ver}

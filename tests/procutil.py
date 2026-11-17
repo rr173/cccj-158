@@ -123,6 +123,33 @@ class Worker:
     def gc(self):
         return self.send({"cmd": "gc"})["report"]
 
+    def mv_define(self, name, left_table, right_table, left_join_column,
+                  right_join_column, join_kind, groups, aggregates):
+        out = self.send({"cmd": "mv_define", "name": name,
+                         "left_table": left_table, "right_table": right_table,
+                         "left_join_column": left_join_column,
+                         "right_join_column": right_join_column,
+                         "join_kind": join_kind, "groups": groups,
+                         "aggregates": aggregates})
+        assert out["ok"], out
+        return out
+
+    def mv_start(self, name):
+        out = self.send({"cmd": "mv_start", "name": name})
+        assert out["ok"], out
+        return out["status"]
+
+    def mv_build(self, name, budget=3):
+        return self.send({"cmd": "mv_build", "name": name, "budget": budget})
+
+    def mv_cancel(self, name):
+        out = self.send({"cmd": "mv_cancel", "name": name})
+        assert out["ok"], out
+        return out["status"]
+
+    def mv_status(self, name):
+        return self.send({"cmd": "mv_status", "name": name})["status"]
+
     def close(self):
         if self._closed:
             return

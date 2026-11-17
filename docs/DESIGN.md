@@ -18,7 +18,19 @@ committed_writes(ordinal, txid, table, row_id, op, old/new values,
 gc_leases(txid, expires_wall)
 reference_constraints(constraint_name, parent_table, child_table,
                       child_column, on_delete, registered_version, created_wall)
+materialized_defs(mv_name, state, left_table, right_table, join columns,
+                  join_kind, definition_json, output_columns_json, cut_version,
+                  maintained_version)
+materialized_builds(mv_name, cut_version, left/right cursor, phase,
+                    catchup_from_version)
+materialized_groups(mv_name, group_token, group_key_json, active)
+materialized_accum(mv_name, group_key_json, group_token, measures_json)
+materialized_group_keys(mv_name, group_key_json, join_key, null_scope)
+materialized_indexes(table_name, column_name, refcount)
+materialized_maintenance_stats(mv_name, commit_version, phase, source rows read,
+                               helper records read, groups written)
 <relation>_rows(row_id, version, deleted, <declared columns>)  history
+<summary>_rows(row_id, version, deleted, <output columns>)     summary history
 ```
 
 `commit_version` is a monotonically increasing counter.  Every committed
@@ -400,4 +412,98 @@ Reads deliberately do not predict cascades: pre-commit `read` keeps the
 "start view plus own staged operations" semantics, because a transaction is
 entitled to reason about the state it staged, and only the atomic commit
 decides the final reference-valid state and its propagation.
+
+## 9. Materialized join-aggregate summaries
+
+### Restricted declaration and physical output
+
+`materialized_defs` stores one frozen JSON declaration per named summary: two
+different ordinary tables, one text join column per side, an `inner`/`left`
+join, typed group references with output aliases, and `count_star` /
+`count` / `sum(int64)` aggregates.  Validation is exhaustive before
+persistence, so no half definition exists; the name is reserved in both the
+materialized catalog and the ordinary table catalog, and a name can never
+silently change definition.
+
+The output is an append-only history table `<name>_rows` with the exact
+`(row_id, version, deleted, <output columns>)` shape of an ordinary managed
+table, plus a frozen descriptor in `materialized_defs.output_columns_json`.
+Reads therefore go through the normal snapshot materialization, predicate
+compilation, `predicate_reads` evidence and read-invalidation path; writes,
+online `add_column` and reference-constraint endpoints explicitly reject a
+materialized name.  Group tuples are encoded as ordered JSON of the original
+typed values (`canonical.values_to_json`), which preserves bool/int and
+null/"" distinctions without separator concatenation.
+
+### Paged build pinned at one cut
+
+`start_materialized_build` reads `commit_version` into the build row's
+`cut_version` inside one write transaction, so the cut and the build's
+retention responsibility appear atomically.  The cut scan keysets the left
+history at that cut (`row_id > cursor LIMIT budget`); every page is one short
+transaction and both cursors reference the same cut, so pages can never mix
+source positions.  Join-column helper indexes
+(`materialized_indexes`, reference-counted and shared across definitions) make
+the right-side lookup per page an indexed key query, and the nested join loop
+streams straight into on-disk `materialized_accum` rows — the full join result
+is never held in memory, which is what keeps a large one-key fan-out bounded
+by the number of groups.
+
+Commits landing while the build runs are incorporated by the catch-up phase,
+one source position per step.  Publishing allocates stable tokens in
+`materialized_groups`, writes the first output versions and consumes one
+explicit source position V by bumping `commit_version`; the summary is
+unreadable (`MaterializedNotReady`) until that transaction commits, and its
+first visible state is exactly the source state at V.  Cancellation drops the
+build row, accumulator, group and output structures and releases the join
+indexes and the GC pin; the definition remains as a tombstoned name.
+
+### Key-scoped maintenance and the group-key membership index
+
+The hard part of incremental join maintenance is that group tuples and join
+keys are many-to-many: different join keys can feed the same group.
+`materialized_group_keys` records, per active group, exactly the non-null join
+keys and the left-null marker whose current join rows feed it.  Maintenance
+then has an exact, converging scope:
+
+1. seed with the commit's changed non-null keys and (left mode) the null scope;
+2. expand to the groups those keys feed via `materialized_group_keys`;
+3. expand again to the full persisted key universe of those groups, plus the
+   changed keys (which brand-new groups do not yet reference);
+4. load both sides at the pre- and post-commit versions over that universe via
+   indexed key queries, fold the commit's net change differently into each
+   state, and recompute partial aggregates;
+5. iterate to a fixpoint so a row migrating into an already-existing group
+   pulls in that group's other keys, then rebuild each affected group's
+   membership from the actual recomputed rows (membership-filtered, so a key
+   whose rows moved out is not retained).
+
+Affected groups are replaced wholesale rather than adjusted by a subtract/add
+delta, which keeps the on-disk accumulator self-consistent across group
+migrations.  Because every query is key-scoped, the verifiable counters in
+`materialized_maintenance_stats` (source rows read, helper records read,
+groups written) stay flat as unrelated keys are added — maintenance never
+scans a whole source table.
+
+### Identity, versioning, overflow and atomicity
+
+`materialized_groups` keeps one row per group tuple forever (with an `active`
+flag), and tokens are allocated from the maximum numeric suffix ever used, so
+an inactive group reappears with its original `row_id` and two groups can never
+share one within a commit.  Output writes happen through the same history
+append, `committed_writes` evidence and (for watched summaries) `sub_changes`
+machinery as ordinary tables; an unchanged business value appends no version
+and no event, while a disappearing group appends a tombstone.
+
+Overflow is checked only on the *final* recomputed totals; all intermediate
+arithmetic is unbounded Python int arithmetic, so a valid final result cannot
+trip a false alarm mid-subtract.  A final count or sum outside the int64 range
+produces a `materialized_overflow` conflict before the source position is
+consumed, and the whole commit — source rows and summary rows — rolls back.
+The maintenance plan is computed before the version bump and applied in the
+committer's single atomic transaction together with the source history,
+cascade tombstones, evidence and change log, so a crash leaves either the old
+consistent state or the new one, never a half-maintained summary, and a
+re-sent commit replays the durable decision without re-applying anything.
+
 

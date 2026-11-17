@@ -105,6 +105,20 @@ def register(client, name, parent_table, child_table, child_column, on_delete):
     between the scan and the durable insert.  Raises :class:`ReferenceError` for
     every malformed or unsupported declaration.
     """
+    from .errors import MaterializedError
+
+    def _not_mv(tname):
+        row = client.store.run_tx(
+            lambda conn: conn.execute(
+                "SELECT 1 FROM materialized_defs WHERE mv_name=?", (tname,)
+            ).fetchone(), readonly=True)
+        if row is not None:
+            raise MaterializedError(
+                "materialized summary %r is read-only and cannot be one end of a "
+                "reference constraint" % tname)
+
+    _not_mv(parent_table)
+    _not_mv(child_table)
     if not isinstance(name, str) or not name.strip():
         raise ReferenceError("constraint name must be a non-empty string")
     client.store.check_ident(name, "constraint name")

@@ -134,6 +134,25 @@ def handle_command(client, handles, cmd):
         return {"ok": True, "report": client.gc_versions()}
     if name == "rows":
         return {"ok": True, "rows": client.rows(cmd["table"])}
+    if name == "mv_define":
+        client.define_materialized_summary(
+            cmd["name"], cmd["left_table"], cmd["right_table"],
+            cmd["left_join_column"], cmd["right_join_column"],
+            cmd["join_kind"], cmd["groups"], cmd["aggregates"])
+        return {"ok": True}
+    if name == "mv_start":
+        return {"ok": True,
+                "status": client.start_materialized_build(cmd["name"])}
+    if name == "mv_build":
+        return {"ok": True,
+                "status": client.build_materialized_step(
+                    cmd["name"], budget=cmd.get("budget", 3))}
+    if name == "mv_cancel":
+        return {"ok": True,
+                "status": client.cancel_materialized_build(cmd["name"])}
+    if name == "mv_status":
+        return {"ok": True,
+                "status": client.materialized_status(cmd["name"])}
     if name == "exit":
         return {"ok": True, "bye": True}
     raise ValueError("unknown command %r" % (name,))

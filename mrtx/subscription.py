@@ -183,35 +183,44 @@ def _frozen_schema(store, tables, conn=None):
     existing consumers keep working; the parallel default map carries the value
     of every column that was added online with a default.  When *conn* is given
     the catalog is read on that open connection (used inside a write tx);
-    otherwise a short read transaction is opened.
+    otherwise a short read transaction is opened.  Active materialized summaries
+    are served from their frozen output descriptor and never carry defaults; an
+    inactive (still building or cancelled) one cannot be subscribed.
     """
-    if conn is not None:
+    def _resolve(open_conn):
         types = {}
         defaults = {}
         for table in tables:
-            _lt, tdefault, descriptors = store.latest_schema_conn(conn, table)
-            types[table] = {d["name"]: d["type"] for d in descriptors}
+            mv = open_conn.execute(
+                "SELECT state, output_columns_json FROM materialized_defs "
+                "WHERE mv_name=?", (table,)).fetchone()
+            if mv is not None:
+                if mv["state"] != "active":
+                    raise SubscriptionError(
+                        "materialized summary %r is not active and cannot be subscribed"
+                        % table)
+                types[table] = {c["name"]: c["type"]
+                                for c in json.loads(mv["output_columns_json"])}
+                defaults[table] = {}
+                continue
+            if open_conn.execute("SELECT 1 FROM tables WHERE table_name=?",
+                                 (table,)).fetchone() is None:
+                raise SchemaError("subscription names unknown table %r" % (table,))
+            _lt, tdefault, descriptors = store.latest_schema_conn(open_conn, table)
+            cols = {}
+            for desc in descriptors:
+                name, ctype = desc["name"], desc["type"]
+                if ctype not in COLUMN_TYPES:
+                    raise SchemaError("table %s has unsupported column type %r"
+                                      % (table, ctype))
+                cols[name] = ctype
+            types[table] = cols
             defaults[table] = tdefault
         return types, defaults
 
-    columns = store.column_types()
-    types = {}
-    defaults = {}
-    for table in tables:
-        if table not in columns:
-            raise SchemaError("subscription names unknown table %r" % (table,))
-        types[table] = cols = {}
-        defaults[table] = tdefs = {}
-        _lt, tdefault, descriptors = store.latest_schema(table)
-        for desc in descriptors:
-            name, ctype = desc["name"], desc["type"]
-            if ctype not in COLUMN_TYPES:
-                raise SchemaError("table %s has unsupported column type %r"
-                                  % (table, ctype))
-            cols[name] = ctype
-            if desc.get("has_default"):
-                tdefs[name] = desc.get("default")
-    return types, defaults
+    if conn is not None:
+        return _resolve(conn)
+    return store.run_tx(lambda open_conn: _resolve(open_conn), readonly=True)
 
 
 def _now():

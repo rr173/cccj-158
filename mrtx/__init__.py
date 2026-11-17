@@ -21,7 +21,8 @@ from .errors import (ConflictError, ManagedTxError, PredicateError, SchemaError,
                      SchemaConflictError, TransactionError, TransactionNotFound,
                      BusyError, SubscriptionError, SubscriptionNotFound,
                      SubscriptionClosed, StaleSubscriptionGeneration, ReplicaError,
-                     ReplicaNotReady, ReplicaGenerationError, ReferenceError)
+                     ReplicaNotReady, ReplicaGenerationError, ReferenceError,
+                     MaterializedError, MaterializedNotReady)
 from .subscription import Subscription, SubscriptionHandle
 from .replica import Replica
 from .values import (And, Atom, FALSE, LiteralFalse, LiteralTrue, Not, Or, TRUE,

@@ -24,7 +24,7 @@ import time
 from .errors import BusyError, InternalInvariantError, SchemaError
 from .values import COLUMN_TYPES, check_value, TYPE_BOOL, TYPE_INT, TYPE_TEXT, TYPE_NULL
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 
@@ -255,6 +255,109 @@ BASE_DDL = [
     """,
     "CREATE INDEX IF NOT EXISTS ref_by_parent ON reference_constraints(parent_table)",
     "CREATE INDEX IF NOT EXISTS ref_by_child ON reference_constraints(child_table)",
+    # -- materialized join-aggregate summaries -------------------------------
+    # One durable row per registered definition.  The declaration is frozen as
+    # JSON (restricted references only -- no arbitrary SQL); ``state`` moves
+    # defined -> building -> active (or -> cancelled / -> failed).  ``cut`` is
+    # the single source position the paged initial build is anchored at;
+    # ``maintained_version`` is the source position whose state the durable
+    # output already reflects.  A row stays after cancellation so its name can
+    # never silently acquire a different definition.
+    """
+    CREATE TABLE IF NOT EXISTS materialized_defs (
+        mv_name TEXT PRIMARY KEY,
+        state TEXT NOT NULL,
+        left_table TEXT NOT NULL,
+        right_table TEXT NOT NULL,
+        left_join_column TEXT NOT NULL,
+        right_join_column TEXT NOT NULL,
+        join_kind TEXT NOT NULL CHECK (join_kind IN ('inner', 'left')),
+        definition_json TEXT NOT NULL,
+        output_columns_json TEXT NOT NULL,
+        cut_version INTEGER,
+        maintained_version INTEGER NOT NULL DEFAULT 0,
+        created_wall REAL NOT NULL,
+        updated_wall REAL NOT NULL)
+    """,
+    "CREATE INDEX IF NOT EXISTS mv_defs_state ON materialized_defs(state)",
+    # Resumable, paged build progress: one row per definition while building.
+    # Both pagination cursors refer to the same frozen cut_version, so the two
+    # source tables can never mix rows from different source positions.
+    """
+    CREATE TABLE IF NOT EXISTS materialized_builds (
+        mv_name TEXT PRIMARY KEY,
+        cut_version INTEGER NOT NULL,
+        left_cursor_row TEXT NOT NULL,
+        right_cursor_row TEXT NOT NULL,
+        phase TEXT NOT NULL,             -- initial | catchup | publishing
+        catchup_from_version INTEGER NOT NULL,
+        updated_wall REAL NOT NULL)
+    """,
+    # The stable group identity mapping.  ``group_token`` is the managed
+    # row_id of the output row; it is allocated once per distinct group tuple
+    # and retained while the group is inactive, so a group that disappears and
+    # reappears keeps the same identity and different groups never share one.
+    """
+    CREATE TABLE IF NOT EXISTS materialized_groups (
+        mv_name TEXT NOT NULL,
+        group_token TEXT NOT NULL,
+        group_key_json TEXT NOT NULL,
+        active INTEGER NOT NULL,
+        PRIMARY KEY (mv_name, group_token))
+    """,
+    "CREATE INDEX IF NOT EXISTS mv_groups_lookup "
+    "ON materialized_groups(mv_name, group_key_json)",
+    # On-disk partial aggregates for the paged initial build and the SUM
+    # non-null counts needed forever after activation.  No full join result is
+    # ever held in memory; pages stream into these rows.
+    """
+    CREATE TABLE IF NOT EXISTS materialized_accum (
+        mv_name TEXT NOT NULL,
+        group_key_json TEXT NOT NULL,
+        group_token TEXT,
+        measures_json TEXT NOT NULL,
+        PRIMARY KEY (mv_name, group_key_json))
+    """,
+    # The set of non-null join keys that currently feed each group, plus a
+    # marker for the null-key left rows in left mode.  A group tuple is not
+    # bound to one join key (different keys can land in the same group), so
+    # maintenance expands an affected key to every group it touches and then
+    # reloads *all* that group's keys, never just the one key that changed.
+    """
+    CREATE TABLE IF NOT EXISTS materialized_group_keys (
+        mv_name TEXT NOT NULL,
+        group_key_json TEXT NOT NULL,
+        join_key TEXT,
+        null_scope INTEGER NOT NULL,
+        PRIMARY KEY (mv_name, group_key_json, join_key, null_scope))
+    """,
+    "CREATE INDEX IF NOT EXISTS mv_gk_lookup "
+    "ON materialized_group_keys(mv_name, join_key)",
+    # Join-column helper indexes are shared across definitions and reference
+    # counted, so cancelling one build releases only its own responsibility.
+    """
+    CREATE TABLE IF NOT EXISTS materialized_indexes (
+        table_name TEXT NOT NULL,
+        column_name TEXT NOT NULL,
+        refcount INTEGER NOT NULL,
+        PRIMARY KEY (table_name, column_name))
+    """,
+    # Verifiable maintenance statistics, one row per maintained source commit.
+    # Reads performed only to check whether an output value changed are
+    # counted too; the engine's own transaction validation is separate.
+    """
+    CREATE TABLE IF NOT EXISTS materialized_maintenance_stats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        mv_name TEXT NOT NULL,
+        commit_version INTEGER,
+        phase TEXT NOT NULL,             -- catchup | maintenance | build
+        source_rows_read INTEGER NOT NULL,
+        helper_records_read INTEGER NOT NULL,
+        groups_written INTEGER NOT NULL,
+        detail_json TEXT NOT NULL)
+    """,
+    "CREATE INDEX IF NOT EXISTS mv_stats_by_mv "
+    "ON materialized_maintenance_stats(mv_name, id)",
 ]
 
 
@@ -383,7 +486,7 @@ class Store:
                              (str(SCHEMA_VERSION),))
                 conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('seq', '0')")
                 conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('commit_version', '0')")
-            elif int(row[0]) in (1, 2, 3):
+            elif int(row[0]) in (1, 2, 3, 4):
                 # v1 -> v2 added the subscription tables; v2 -> v3 adds the
                 # versioned column catalog and the schema-change log.  New
                 # tables are created above with IF NOT EXISTS, but an existing
@@ -418,9 +521,12 @@ class Store:
                             (tname, json.dumps(cols, sort_keys=True)))
                         conn.execute("UPDATE tables SET version=1 WHERE table_name=?",
                                      (tname,))
-                # v3 -> v4 adds the managed reference-constraint catalog.  The
+                # v3 -> v4 added the managed reference-constraint catalog.  The
                 # table is created above with IF NOT EXISTS; an existing
                 # repository simply starts with zero declared constraints.
+                # v4 -> v5 adds the materialized-summary catalog and on-disk
+                # build structures; existing repositories simply have no
+                # definitions, and the new tables already exist from the DDL.
                 conn.execute("UPDATE meta SET value=? WHERE key='schema_version'",
                              (str(SCHEMA_VERSION),))
             elif int(row[0]) != SCHEMA_VERSION:
@@ -458,6 +564,10 @@ class Store:
         def _create(conn):
             if conn.execute("SELECT 1 FROM tables WHERE table_name=?", (table,)).fetchone():
                 raise SchemaError("table %r already exists" % table)
+            if conn.execute("SELECT 1 FROM materialized_defs WHERE mv_name=?",
+                            (table,)).fetchone() is not None:
+                raise SchemaError(
+                    "name %r is already used by a materialized summary" % table)
             coldefs = ["row_id TEXT NOT NULL", "version INTEGER NOT NULL",
                        "deleted INTEGER NOT NULL"]
             for name, ctype in columns:
@@ -597,6 +707,12 @@ class Store:
         check_value(default, ctype, "default for %s.%s" % (table, column))
 
         def _migrate(conn):
+            if conn.execute("SELECT 1 FROM materialized_defs WHERE mv_name=?",
+                            (table,)).fetchone() is not None:
+                from .errors import MaterializedError
+                raise MaterializedError(
+                    "materialized summary %r is read-only; online add_column is not "
+                    "allowed" % table)
             if conn.execute("SELECT 1 FROM tables WHERE table_name=?",
                             (table,)).fetchone() is None:
                 raise SchemaError("unknown table %r" % (table,))
